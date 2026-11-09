@@ -9,19 +9,17 @@
 //!   plugin's row join places them (`helio_pass_foliage_place::scene_rows`).
 //!   The wind rows are the foliage api's (`helio_foliage_api::
 //!   WIND_SOURCES_BUFFER`), which water reads too.
-//! - The registrations of the plugin's Helio features (placement and the
-//!   G-buffer drawer, `helio_pass_foliage_gbuffer::FoliageFeature`), their
-//!   settings (`helio_pass_foliage_place::FOLIAGE`), its scene rows, the
-//!   one-wind level rule and the realtime redraw while foliage sways.
+//! - What the engine runs for them, each through a generic registration
+//!   (the engine names no foliage type): the plugin's Helio features
+//!   ([`render_features`]: placement and the G-buffer drawer,
+//!   `helio_pass_foliage_gbuffer::FoliageFeature`) and their settings
+//!   ([`configure_renderer`], `helio_pass_foliage_place::FOLIAGE`), its
+//!   scene rows ([`register_columns`], [`derivation`]), the one-wind level
+//!   rule ([`winds`], [`ONE_WIND`]) and the realtime redraw while foliage
+//!   sways ([`foliage_in_wind`]).
 //!
-//! Everything registers through `inventory` once the crate is linked: hosts link it
-//! without naming it (a game built for a project links the runtime modules
-//! of the plugins its `Pulsar.toml` enables, the editor every installed
-//! plugin through `installed_plugins`; `pulsar_plugins`) and know no foliage type.
-
-// The plugin's descriptor (`../pulsar-plugin.toml`): linking this crate
-// installs the plugin; a project enables it or not (`pulsar_plugins`).
-pulsar_plugins::installed!("../pulsar-plugin.toml");
+//! This crate registers nothing itself: the plugin's root crate
+//! (`foliage_plugin`) submits every registration above, in one place.
 
 pub mod foliage;
 pub mod wind;
@@ -167,12 +165,15 @@ derived_row!(
     wind_clear
 );
 
-fn register_columns(store: &mut SceneGpuStore, device: &std::sync::Arc<wgpu::Device>) {
+/// Registers the foliage and wind source rows (the scene rows' columns).
+pub fn register_columns(store: &mut SceneGpuStore, device: &std::sync::Arc<wgpu::Device>) {
     FoliageSourceRow::register_gpu_columns_growable(store, 8, device);
     GlobalWindSourceRow::register_gpu_columns_growable(store, 2, device);
 }
 
-fn derivation(
+/// The plugin's row join: places the foliage types, their layers and the
+/// wind rows (`helio_pass_foliage_place::scene_rows`).
+pub fn derivation(
     device: &wgpu::Device,
     keys: helio_scene_join::RowJoinKeys,
 ) -> Box<dyn helio_scene_join::SceneDerivation> {
@@ -185,14 +186,6 @@ fn derivation(
             wind: key(helio_foliage_api::WIND_SOURCES_BUFFER),
         },
     ))
-}
-
-inventory::submit! {
-    engine_backend::scene::helio_bridge::SceneRowsRegistration {
-        origin: pulsar_plugins::origin!(),
-        register_columns,
-        derivation,
-    }
 }
 
 /// Why adding a second global wind is refused.
@@ -219,27 +212,12 @@ pub fn level_wind(world: &World) -> Option<(Entity, Entity)> {
     ))
 }
 
-// A level has one global wind, edited in World Settings like the sky.
-inventory::submit! {
-    engine_backend::scene::level_rules::LevelSingletonRegistration {
-        origin: pulsar_plugins::origin!(),
-        class_name: WIND_CLASS_NAME,
-        refusal: ONE_WIND,
-        instances: winds,
-        is: |value| value.is::<WindComponent>(),
-        held: |world, instance| world.get::<WindComponent>(instance).is_some(),
-        default_is: true,
-        enabled_only: false,
-        edits_checked: false,
-    }
-}
-
 /// The foliage passes' one wind (as the join picks it): a foliage
 /// component's own wind when one opts out of the global wind, else the
 /// level's global wind, else the components' own. Approximated by the
 /// fastest candidate at the deciding level. Foliage in a wind faster than
 /// calm keeps a realtime viewport drawing.
-fn foliage_in_wind(world: &World) -> bool {
+pub fn foliage_in_wind(world: &World) -> bool {
     use pulsar_scene_model::attachments;
     let foliage: Vec<&FoliageComponent> = world
         .query::<&FoliageComponent>()
@@ -276,49 +254,17 @@ fn foliage_in_wind(world: &World) -> bool {
     }
 }
 
-// The answer reads both components: re-checked when either changes.
-inventory::submit! {
-    engine_backend::subsystems::render::AnimatedContentRegistration {
-        origin: pulsar_plugins::origin!(),
-        watch: |world| world.open_change_cursor::<FoliageComponent>(),
-        animated: foliage_in_wind,
-    }
-}
-
-inventory::submit! {
-    engine_backend::subsystems::render::AnimatedContentRegistration {
-        origin: pulsar_plugins::origin!(),
-        watch: |world| world.open_change_cursor::<WindComponent>(),
-        animated: foliage_in_wind,
-    }
-}
-
 /// Foliage's features: placement (before the G-buffer) and its drawer.
-fn render_features() -> helio_feature_api::FeatureSet {
+pub fn render_features() -> helio_feature_api::FeatureSet {
     helio_feature_api::FeatureSet::new().with(helio_pass_foliage_gbuffer::FoliageFeature)
 }
 
 /// The features' settings from the project's foliage settings.
-fn configure_renderer(config: helio::RendererConfig) -> helio::RendererConfig {
+pub fn configure_renderer(config: helio::RendererConfig) -> helio::RendererConfig {
     use engine_backend::subsystems::render::helio_renderer::project_settings;
     config.with_feature(helio_pass_foliage_place::FoliageSettings::from_settings(
         &project_settings::resolved(&helio_pass_foliage_place::FOLIAGE),
     ))
-}
-
-inventory::submit! {
-    engine_backend::subsystems::render::RenderFeatureRegistration {
-        origin: pulsar_plugins::origin!(),
-        features: render_features,
-        configure: configure_renderer,
-    }
-}
-
-inventory::submit! {
-    pulsar_settings::project::rendering::SettingsGroupRegistration {
-        origin: pulsar_plugins::origin!(),
-        group: &helio_pass_foliage_place::FOLIAGE,
-    }
 }
 
 #[cfg(test)]
@@ -362,26 +308,5 @@ mod tests {
         foliage.general.enabled = false;
         let row = FoliageSourceRow::of(&foliage);
         assert!(bytemuck::bytes_of(&row).iter().all(|byte| *byte == 0));
-    }
-
-    #[test]
-    fn registers_its_features_settings_and_level_rule() {
-        let features =
-            engine_backend::subsystems::render::helio_renderer::render_features::plugin_features();
-        assert!(
-            features.ids().contains(&"helio.foliage"),
-            "features: {:?}",
-            features.ids()
-        );
-        assert!(
-            pulsar_settings::project::rendering::groups()
-                .iter()
-                .any(|group| std::ptr::eq(*group, &helio_pass_foliage_place::FOLIAGE))
-        );
-        assert!(
-            inventory::iter::<engine_backend::scene::level_rules::LevelSingletonRegistration>
-                .into_iter()
-                .any(|rule| rule.class_name == WIND_CLASS_NAME)
-        );
     }
 }

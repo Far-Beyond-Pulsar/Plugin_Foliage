@@ -14,7 +14,7 @@
 //! wind row (`"foliage_wind"`). How the wind moves over time is the
 //! renderer's frame clock, not part of the row.
 
-use engine_class_derive::{engine_class, register_world_component};
+use engine_class_derive::{engine_class, world_component};
 
 /// The class name scripts and level files use.
 pub const WIND_CLASS_NAME: &str = "WindComponent";
@@ -80,7 +80,8 @@ impl WindComponent {
     }
 }
 
-#[register_world_component]
+// The plugin's root crate registers the class (`submit_world_component!`).
+#[world_component]
 impl WindComponent {}
 
 #[cfg(test)]

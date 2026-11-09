@@ -1,16 +1,17 @@
 //! The level's global wind (#1123) in the level editor: its Create entry and
 //! its World Settings section (and place in the environment mixer).
 //!
-//! A level has at most one: its `WindComponent` ([`level_wind`], a level
+//! A level has at most one: its `WindComponent` (`level_wind`, a level
 //! rule of this plugin); every foliage component sways in it (unless one
 //! opts out for its own wind). Without one, foliage uses the components'
 //! own wind. The section shows the wind's properties when the level has one
-//! and a button that creates it when it does not ([`create_wind`]).
+//! and a button that creates it when it does not ([`create_wind`]). The
+//! plugin's root crate registers both.
 
-use foliage_component::{WIND_CLASS_NAME, WindComponent, level_wind};
+use foliage_component::WindComponent;
 use ui_level_editor::LevelEditorState;
 use ui_level_editor::commands::{CommandResult, TypedComponent};
-use ui_level_editor::extend::{CreateEntry, LevelComponentSection, add_object};
+use ui_level_editor::extend::add_object;
 use ui_level_editor::scene_edit::{ObjectType, Transform};
 
 /// Name of the object [`create_wind`] adds.
@@ -30,37 +31,17 @@ pub fn create_wind(state: &mut LevelEditorState) -> CommandResult {
     )
 }
 
-inventory::submit! {
-    CreateEntry {
-        origin: pulsar_plugins::origin!(),
-        id: "wind",
-        menu_label: Some(|| rust_i18n::t!("LevelEditor.Create.Wind").to_string()),
-        environment_label: None,
-        quick_add: None,
-        offered: None,
-        order: 310,
-        create: create_wind,
-    }
+/// The Create menu's label for [`create_wind`], in the editor's language.
+pub fn wind_menu_label() -> String {
+    rust_i18n::t!("LevelEditor.Create.Wind").to_string()
 }
 
-inventory::submit! {
-    LevelComponentSection {
-        origin: pulsar_plugins::origin!(),
-        title: "Wind",
-        sidebar_title: "Global Wind",
-        sidebar_missing: "Missing · creates global wind",
-        order: 10,
-        class_name: WIND_CLASS_NAME,
-        find: level_wind,
-        missing_note: "This level has no global wind: foliage sways in its own wind.",
-        create_label: "Create Wind",
-        create: create_wind,
-        describe: |object, enabled| {
-            if enabled {
-                format!("The global wind is {object}'s WindComponent.")
-            } else {
-                format!("{object}'s WindComponent is disabled, so foliage sways in its own wind.")
-            }
-        },
+/// The World Settings section's line about the level's wind: which
+/// object's `WindComponent` it is, and whether it applies.
+pub fn describe_wind(object: &str, enabled: bool) -> String {
+    if enabled {
+        format!("The global wind is {object}'s WindComponent.")
+    } else {
+        format!("{object}'s WindComponent is disabled, so foliage sways in its own wind.")
     }
 }

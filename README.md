@@ -19,15 +19,20 @@ draw phases and api crates.
 
 | Crate | Path | What |
 |---|---|---|
+| `foliage_plugin` | `./` | Foliage (`pulsar.foliage`): the plugin's root crate, the one place it registers everything it contributes (runtime registrations always, the editor's with `editor`) |
 | `helio-foliage-api` | `api/` | The foliage feature's public contract: GPU records, packing, placement reference maths, the ground protocol, SceneDB rows and the shared WGSL. No wgpu. |
-| `foliage_component` | `component/` | Foliage (pulsar.foliage): the foliage and wind components, their rows, settings and the registrations of the plugin's Helio feature (placement and the G-buffer drawer) |
-| `foliage_plugin` | `editor/` | Foliage (pulsar.foliage): the editor plugin -- its metadata, over the plugin's component crate |
+| `foliage_component` | `component/` | Foliage (pulsar.foliage): the foliage and wind components, their rows, row join, level rule and the plugin's Helio feature set (placement and the G-buffer drawer); the plugin's root crate registers them |
+| `foliage_editor` | `editor/` | Foliage (pulsar.foliage): the editor crate -- the Foliage tool mode and its palette, the level's wind entry and World Settings section, over the plugin's component crate |
 | `foliage-examples` | `examples/` | The foliage plugin's standalone hosts on Helio: the foliage demo |
 | `helio-pass-foliage-gbuffer` | `feature/gbuffer/` | Helio render pass: foliage blade/card rasterisation into the G-buffer |
 | `helio-pass-foliage-place` | `feature/place/` | Foliage tile residency, GPU placement, tile/cluster culling and per-LOD compaction for Helio |
 
-- **Runtime module** (what a game built for a project links): `foliage_component`.
-- **Editor module** (what the editor links in addition): `foliage_plugin`.
+- **Root crate**: `foliage_plugin`. It is the one place the plugin submits
+  its contributions (component classes, features, scene seams, settings,
+  editor tools), each naming it as origin, so the plugin gate and the
+  plugin catalog see all of them. The other crates submit none (only type
+  attachments, such as a component's GPU mirror, stay with their types). A
+  game links the root without its `editor` feature; the editor links it with.
 - **Requires**: nothing. A project enables or disables the plugin in its
   `Pulsar.toml` (`[plugins]`); disabled, the kind is absent and the frame
   draws without it.
@@ -45,8 +50,8 @@ only inside a Pulsar-Native checkout:
 ```bash
 git clone --recursive https://github.com/Far-Beyond-Pulsar/Pulsar-Native
 cd Pulsar-Native
-cargo check -p helio-foliage-api -p foliage_component -p foliage_plugin -p foliage-examples -p helio-pass-foliage-gbuffer -p helio-pass-foliage-place --tests
-cargo test -p helio-foliage-api -p foliage_component -p helio-pass-foliage-gbuffer -p helio-pass-foliage-place
+cargo check -p helio-foliage-api -p foliage_component -p foliage_plugin -p foliage_editor -p foliage-examples -p helio-pass-foliage-gbuffer -p helio-pass-foliage-place --tests
+cargo test -p helio-foliage-api -p foliage_plugin -p foliage_component -p helio-pass-foliage-gbuffer -p helio-pass-foliage-place
 ```
 
 Suites that render real frames need a GPU; CI leaves them out by name

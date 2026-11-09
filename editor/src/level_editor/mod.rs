@@ -1,5 +1,5 @@
-//! Foliage in the level editor, registered through its extension points
-//! (`ui_level_editor::extend`):
+//! Foliage in the level editor, which the plugin's root crate registers
+//! through the level editor's extension points (`ui_level_editor::extend`):
 //! - the **Foliage** tool mode: the palette of foliage sets and its brush
 //!   ([`panel::FoliageSetsPanel`]), Unreal's Foliage mode beside its
 //!   Landscape mode (the voxel worlds' Terrain mode is the voxel plugin's);
@@ -16,7 +16,6 @@ pub mod wind;
 use std::sync::{Arc, LazyLock};
 
 use gpui::AppContext as _;
-use ui_level_editor::extend::{EditorData, PluginState as _, ToolModeRegistration};
 use ui_level_editor::{
     LevelEditorState, ModeLayout, ModePanelContext, StatusReadout, ToolMode, ToolModeContext,
     ToolModeId, ToolPointerEvent, ToolPointerResult,
@@ -105,32 +104,32 @@ impl ToolMode for FoliageMode {
     }
 }
 
-inventory::submit! {
-    ToolModeRegistration {
-        origin: pulsar_plugins::origin!(),
-        order: 30,
-        make: || Box::new(FoliageMode),
-    }
+/// A new Foliage mode (its tool mode registration's factory).
+pub fn foliage_mode() -> Box<dyn ToolMode> {
+    Box::new(FoliageMode)
 }
 
 // ── The palette in the level file ───────────────────────────────────────────
 
-inventory::submit! {
-    EditorData {
-        origin: pulsar_plugins::origin!(),
-        key: "foliage_sets",
-        save: |state| serde_json::to_value(&domain(state).foliage_sets).ok(),
-        load: |state, value| {
-            let library = value
-                .and_then(|value| {
-                    serde_json::from_value::<foliage_sets::FoliageSetLibrary>(value.clone())
-                        .map_err(|error| tracing::warn!("Foliage palette not read: {error}"))
-                        .ok()
-                })
-                .unwrap_or_default();
-            state.editor.plugins.get_mut::<FoliageDomain>().foliage_sets = library;
-        },
-    }
+/// The level file's editor section key the palette saves under.
+pub const FOLIAGE_SETS_KEY: &str = "foliage_sets";
+
+/// The palette to save with the level.
+pub fn save_foliage_sets(state: &LevelEditorState) -> Option<serde_json::Value> {
+    serde_json::to_value(&domain(state).foliage_sets).ok()
+}
+
+/// Restores the palette a level saved (an empty one when it saved none or
+/// its section does not read).
+pub fn load_foliage_sets(state: &mut LevelEditorState, value: Option<&serde_json::Value>) {
+    let library = value
+        .and_then(|value| {
+            serde_json::from_value::<foliage_sets::FoliageSetLibrary>(value.clone())
+                .map_err(|error| tracing::warn!("Foliage palette not read: {error}"))
+                .ok()
+        })
+        .unwrap_or_default();
+    state.editor.plugins.get_mut::<FoliageDomain>().foliage_sets = library;
 }
 
 // ── The panel kit, in this plugin's text and state ──────────────────────────
