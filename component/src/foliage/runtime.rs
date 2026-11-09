@@ -1,7 +1,7 @@
 //! Foliage reaches the foliage passes through its derived source row
 //! (`environment_rows::FoliageSourceRow`), built from the mappings here.
 
-use engine_class_derive::register_world_component;
+use engine_class_derive::world_component;
 
 use super::FoliageComponent;
 
@@ -191,18 +191,6 @@ impl FoliageComponent {
     }
 }
 
-#[register_world_component]
+// The plugin's root crate registers the class (`submit_world_component!`).
+#[world_component]
 impl FoliageComponent {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn registers_under_its_class_name() {
-        assert_eq!(
-            pulsar_world_registry::component_id_for_class("FoliageComponent"),
-            Some(pulsar_scenedb::component_id::<FoliageComponent>())
-        );
-    }
-}

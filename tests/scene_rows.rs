@@ -6,10 +6,13 @@
 // The join harness is the engine's; not every test here uses every helper.
 #![allow(dead_code)]
 
+// The plugin as a game links it: its root, with every registration.
+use foliage_plugin as _;
+
 use std::sync::Arc;
 
 use engine_backend::scene::{SceneWorldExt, SpawnObject, Transform, Visibility, attachments};
-use foliage_component::FoliageComponent;
+use foliage_plugin::foliage_component::FoliageComponent;
 use helio_core::ENTITY_GENERATIONS_KEY;
 use helio_scene_join::{
     BufferHandle, BufferKey, SceneBufferProjection, SceneDerivation, SceneDerivationContext,
@@ -261,7 +264,7 @@ fn foliage_types_layers_and_wind_are_packed() {
 /// disabled global wind gives the components their own wind back.
 #[test]
 fn foliage_sways_in_the_global_wind_unless_it_opts_out() {
-    use foliage_component::WindComponent;
+    use foliage_plugin::foliage_component::WindComponent;
     type WindRow = helio_pass_foliage_place::components::FoliageWindRow;
     let Some((device, queue)) = device() else {
         eprintln!("skipping: no GPU adapter available");
