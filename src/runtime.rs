@@ -29,7 +29,7 @@ inventory::submit! {
         origin: pulsar_plugins::origin!(),
         name: "foliage.foliage_and_wind",
         register_columns: foliage_component::register_columns,
-        derivation: foliage_component::derivation,
+        derivation: Some(foliage_component::derivation),
     }
 }
 

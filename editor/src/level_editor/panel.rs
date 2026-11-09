@@ -4,7 +4,7 @@
 //!
 //! All state lives in `FoliageDomain::foliage_sets`
 //! ([`super::foliage_sets`]); this file is only the view.
-//! One [`MeshAssetPicker`] serves the whole panel: it always edits the
+//! One [`AssetPicker`] serves the whole panel: it always edits the
 //! *selected* member, so "Add Mesh" creates an empty member, selects it, and
 //! the inspector's picker fills it in.
 
@@ -19,7 +19,7 @@ use ui::{
     popover::Popover,
     v_flex,
 };
-use ui_common::{AssetPickedEvent, AssetQuery, MeshAssetPicker};
+use ui_common::{AssetPickedEvent, AssetPicker, AssetQuery};
 
 use super::brush::{FoliageDomain, FoliageTool};
 use super::foliage_sets::{FoliageSelection, FoliageSetLibrary, MemberId, MemberPlacement, SetId};
@@ -66,7 +66,7 @@ pub struct FoliageSetsPanel {
     last_signature: FoliageSignature,
     pump_started: bool,
     /// Created on first render (needs a `Window`).
-    picker: Option<Entity<MeshAssetPicker>>,
+    picker: Option<Entity<AssetPicker>>,
     /// Which member the picker's highlight currently reflects, so it is
     /// re-pointed only when the selection actually moves.
     picker_for: Option<(SetId, MemberId)>,
@@ -155,9 +155,8 @@ impl FoliageSetsPanel {
             .into_iter()
             .map(AssetQuery::extension)
             .collect();
-        let picker = cx.new(|cx| {
-            MeshAssetPicker::new(String::new(), vec![], project_root, queries, window, cx)
-        });
+        let picker =
+            cx.new(|cx| AssetPicker::new(String::new(), vec![], project_root, queries, window, cx));
         cx.subscribe(&picker, |this, picker, _: &AssetPickedEvent, cx| {
             let path = picker.read(cx).selected_path().to_string();
             edit_library(&this.state, |library| {
@@ -927,7 +926,7 @@ impl FoliageSetsPanel {
                         .child(t!("LevelEditor.FoliagePanel.Mesh").to_string()),
                 )
                 .child(
-                    Popover::<MeshAssetPicker>::new(format!("foliage-mesh-picker-{}", member_id.0))
+                    Popover::<AssetPicker>::new(format!("foliage-mesh-picker-{}", member_id.0))
                         .anchor(Corner::BottomRight)
                         .trigger(
                             Button::new(format!("foliage_mesh_btn_{}", member_id.0))
