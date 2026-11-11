@@ -846,7 +846,9 @@ impl RenderPass for FoliageGBufferPass {
     }
 
     fn prepare(&mut self, ctx: &PrepareContext) -> HelioResult<()> {
-        let type_handle = ctx.scene_buffers.get(helio_foliage_api::FOLIAGE_TYPES.key());
+        let type_handle = ctx
+            .scene_buffers
+            .get(helio_foliage_api::FOLIAGE_TYPES.key());
         self.type_liveness
             .update(ctx.device, ctx.queue, type_handle);
         let type_handle = type_handle.filter(|handle| self.type_liveness.maybe_live(handle));

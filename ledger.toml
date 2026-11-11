@@ -128,7 +128,7 @@ status = "verified"
 [[pass]]
 crate = "helio-pass-foliage-gbuffer"
 in_default_graph = false
-reads = ["foliage_types", "foliage_wind"]
+reads = ["foliage_layers", "foliage_types", "foliage_wind"]
 owner = "helio-presets (mapping); helio-pass-foliage-gbuffer (algorithm)"
 disposition = "keep: reads the environment join's foliage outputs, derived from FoliageComponent and the level's WindComponent (Phase 4); the wind's clock is the renderer's frame clock (#1109, #1123); limitations #1063, #1064 and one wind for all foliage (#1123)"
 target_contract = "Phase 6; 03-gpu-reflection-and-rendering.md"
@@ -170,7 +170,7 @@ status = "unfinished"
 [[buffer]]
 key = "foliage_layers"
 producers = ["FoliageLayerComponent"]
-consumers = ["helio-pass-foliage-place"]
+consumers = ["helio-pass-foliage-gbuffer", "helio-pass-foliage-place"]
 owner = "helio-scene-derivations environment join (execution output, placed foliage packed into the leading rows in instance order)"
 disposition = "keep: a world-aligned square centred on the owner, spanning the authored altitudes; tiles re-place when the layers change, with the type table's seed; types are not yet bound to their own layers (#1062)"
 target_contract = "Phase 4; 09-component-structure-and-graph-boundary.md"

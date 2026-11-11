@@ -1078,7 +1078,10 @@ impl RenderPass for FoliagePlacePass {
     fn prepare(&mut self, ctx: &PrepareContext) -> HelioResult<()> {
         // SceneDB is the only foliage authoring input. Zero type rows: no work.
         self.active = false;
-        let Some(type_handle) = ctx.scene_buffers.get(helio_foliage_api::FOLIAGE_TYPES.key()) else {
+        let Some(type_handle) = ctx
+            .scene_buffers
+            .get(helio_foliage_api::FOLIAGE_TYPES.key())
+        else {
             return Ok(());
         };
         self.type_liveness
@@ -1152,7 +1155,9 @@ impl RenderPass for FoliagePlacePass {
                     .wrapping_mul(0x9e37_79b9_7f4a_7c15)
         };
         let seed_generation = mix(type_handle) as u32;
-        let layers = ctx.scene_buffers.get(helio_foliage_api::FOLIAGE_LAYERS.key());
+        let layers = ctx
+            .scene_buffers
+            .get(helio_foliage_api::FOLIAGE_LAYERS.key());
         let generation = (mix(type_handle)
             ^ layers.map_or(0, |h| mix(h).rotate_left(29))
             ^ chart.id.wrapping_mul(0xc2b2_ae3d_27d4_eb4f).rotate_left(13))
