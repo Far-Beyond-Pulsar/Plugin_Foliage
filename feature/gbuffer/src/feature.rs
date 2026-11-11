@@ -55,6 +55,10 @@ impl Feature for FoliageFeature {
     }
 
     fn register(&self, registrar: &mut FeatureRegistrar<'_>) {
+        registrar.consumes(helio_foliage_api::FOLIAGE_TYPES);
+        registrar.consumes(helio_foliage_api::FOLIAGE_WIND);
+        registrar.consumes(helio_foliage_api::FOLIAGE_LAYERS);
+        registrar.consumes(helio_foliage_api::FOLIAGE_INTERACTORS);
         // Blades and tufts are placed on the GPU from the layers: no
         // acceleration structure holds them.
         registrar.untraced_geometry(helio_foliage_api::FOLIAGE_LAYERS.name());

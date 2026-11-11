@@ -86,7 +86,6 @@ use bytemuck::{Pod, Zeroable};
 use helio_core::graph::ResourceBuilder;
 use helio_core::{PassContext, PrepareContext, RenderPass, Result as HelioResult};
 use helio_pass_foliage_place::{FoliageQuality, GpuFoliageType};
-use pulsar_scenedb::gpu::BufferKey;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Interface contract with `FoliagePlacePass`
@@ -695,7 +694,11 @@ impl FoliageGBufferPass {
 
 impl RenderPass for FoliageGBufferPass {
     fn scene_buffers(&self) -> &'static [&'static str] {
-        &["foliage_types", "foliage_wind"]
+        const LIST: &[&str] = &[
+            helio_foliage_api::FOLIAGE_TYPES.name(),
+            helio_foliage_api::FOLIAGE_WIND.name(),
+        ];
+        LIST
     }
 
     fn name(&self) -> &'static str {
@@ -843,11 +846,13 @@ impl RenderPass for FoliageGBufferPass {
     }
 
     fn prepare(&mut self, ctx: &PrepareContext) -> HelioResult<()> {
-        let type_handle = ctx.scene_buffers.get(BufferKey::of("foliage_types"));
+        let type_handle = ctx
+            .scene_buffers
+            .get(helio_foliage_api::FOLIAGE_TYPES.key());
         self.type_liveness
             .update(ctx.device, ctx.queue, type_handle);
         let type_handle = type_handle.filter(|handle| self.type_liveness.maybe_live(handle));
-        let wind_handle = ctx.scene_buffers.get(BufferKey::of("foliage_wind"));
+        let wind_handle = ctx.scene_buffers.get(helio_foliage_api::FOLIAGE_WIND.key());
         let tables = type_handle.map(|handle| FoliageTables {
             type_count: (handle.buffer.size() / std::mem::size_of::<GpuFoliageType>() as u64)
                 .min(MAX_FOLIAGE_TYPES as u64) as u32,
@@ -941,12 +946,12 @@ impl RenderPass for FoliageGBufferPass {
         let (key, rebuilt) = {
             let wind_buffer = ctx
                 .scene_buffers
-                .get(BufferKey::of("foliage_wind"))
+                .get(helio_foliage_api::FOLIAGE_WIND.key())
                 .map(|h| &h.buffer)
                 .unwrap_or(&self.placeholder_wind);
             let type_buffer = ctx
                 .scene_buffers
-                .get(BufferKey::of("foliage_types"))
+                .get(helio_foliage_api::FOLIAGE_TYPES.key())
                 .map(|h| &h.buffer)
                 .unwrap_or(&self.placeholder_type);
             let key = (ctx.camera.clone(), wind_buffer.clone(), type_buffer.clone());
@@ -1264,11 +1269,11 @@ impl RenderPass for FoliageBoxesPass {
         // As the draw: no type rows or no wind, no foliage.
         self.active = ctx
             .scene_buffers
-            .get(BufferKey::of("foliage_types"))
+            .get(helio_foliage_api::FOLIAGE_TYPES.key())
             .is_some()
             && ctx
                 .scene_buffers
-                .get(BufferKey::of("foliage_wind"))
+                .get(helio_foliage_api::FOLIAGE_WIND.key())
                 .is_some();
         Ok(())
     }
@@ -1279,12 +1284,12 @@ impl RenderPass for FoliageBoxesPass {
         }
         let wind = ctx
             .scene_buffers
-            .get(BufferKey::of("foliage_wind"))
+            .get(helio_foliage_api::FOLIAGE_WIND.key())
             .map(|h| &h.buffer)
             .unwrap_or(&self.placeholder_wind);
         let types = ctx
             .scene_buffers
-            .get(BufferKey::of("foliage_types"))
+            .get(helio_foliage_api::FOLIAGE_TYPES.key())
             .map(|h| &h.buffer)
             .unwrap_or(&self.placeholder_type);
         let key = (ctx.camera.clone(), wind.clone(), types.clone());

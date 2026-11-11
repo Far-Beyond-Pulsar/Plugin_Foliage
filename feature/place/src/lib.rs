@@ -209,7 +209,7 @@ pub const DEFAULT_WPO_EXTENT_METERS: f32 = 0.5;
 #[inline]
 pub fn foliage_scene_is_present(buffers: &helio_core::SceneBufferProjection) -> bool {
     buffers
-        .get(pulsar_scenedb::gpu::BufferKey::of("foliage_types"))
+        .get(helio_foliage_api::FOLIAGE_TYPES.key())
         .is_some_and(|handle| handle.buffer.size() >= std::mem::size_of::<GpuFoliageType>() as u64)
 }
 

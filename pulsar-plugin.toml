@@ -6,6 +6,10 @@ id = "pulsar.foliage"
 name = "Foliage"
 description = "Foliage and the level's wind: their components, rows, settings and the renderer feature that places and draws them"
 enabled_by_default = true
+provides = [
+    { id = "pulsar.foliage.rows", kind = "buffer", members = ["foliage_types", "foliage_layers", "foliage_interactors", "foliage_wind"], version = 1 },
+    { id = "pulsar.foliage.api", kind = "api", members = ["helio-foliage-api"], version = 1 },
+]
 requires = []
 
 # The plugin's root crate (the package in this directory): the one place it

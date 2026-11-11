@@ -10,7 +10,6 @@ use crate::{
 };
 use glam::DVec3;
 use helio_core::{PassContext, PrepareContext, RenderPass, Result as HelioResult};
-use pulsar_scenedb::gpu::BufferKey;
 use wgpu::util::DeviceExt;
 
 use crate::residency::TileRing;
@@ -1040,7 +1039,12 @@ impl FoliagePlacePass {
 
 impl RenderPass for FoliagePlacePass {
     fn scene_buffers(&self) -> &'static [&'static str] {
-        &["foliage_layers", "foliage_types", "foliage_interactors"]
+        const LIST: &[&str] = &[
+            helio_foliage_api::FOLIAGE_LAYERS.name(),
+            helio_foliage_api::FOLIAGE_TYPES.name(),
+            helio_foliage_api::FOLIAGE_INTERACTORS.name(),
+        ];
+        LIST
     }
 
     fn name(&self) -> &'static str {
@@ -1074,7 +1078,10 @@ impl RenderPass for FoliagePlacePass {
     fn prepare(&mut self, ctx: &PrepareContext) -> HelioResult<()> {
         // SceneDB is the only foliage authoring input. Zero type rows: no work.
         self.active = false;
-        let Some(type_handle) = ctx.scene_buffers.get(BufferKey::of("foliage_types")) else {
+        let Some(type_handle) = ctx
+            .scene_buffers
+            .get(helio_foliage_api::FOLIAGE_TYPES.key())
+        else {
             return Ok(());
         };
         self.type_liveness
@@ -1095,7 +1102,7 @@ impl RenderPass for FoliagePlacePass {
         }
         let mut layer_count = ctx
             .scene_buffers
-            .get(BufferKey::of("foliage_layers"))
+            .get(helio_foliage_api::FOLIAGE_LAYERS.key())
             .map(|h| (h.buffer.size() / LAYER_BYTES) as u32)
             .unwrap_or(0);
         if layer_count > MAX_FOLIAGE_LAYERS {
@@ -1114,7 +1121,7 @@ impl RenderPass for FoliagePlacePass {
             let lo = (world_origin - hi.as_dvec3()).as_vec3();
             self.gather_rows = ctx
                 .scene_buffers
-                .get(BufferKey::of("foliage_interactors"))
+                .get(helio_foliage_api::FOLIAGE_INTERACTORS.key())
                 .map_or(0, |h| (h.buffer.size() / SOURCE_INTERACTOR_BYTES) as u32);
             let mut words = [0u32; 12];
             words[..3].copy_from_slice(&hi.to_array().map(f32::to_bits));
@@ -1148,7 +1155,9 @@ impl RenderPass for FoliagePlacePass {
                     .wrapping_mul(0x9e37_79b9_7f4a_7c15)
         };
         let seed_generation = mix(type_handle) as u32;
-        let layers = ctx.scene_buffers.get(BufferKey::of("foliage_layers"));
+        let layers = ctx
+            .scene_buffers
+            .get(helio_foliage_api::FOLIAGE_LAYERS.key());
         let generation = (mix(type_handle)
             ^ layers.map_or(0, |h| mix(h).rotate_left(29))
             ^ chart.id.wrapping_mul(0xc2b2_ae3d_27d4_eb4f).rotate_left(13))
@@ -1379,12 +1388,12 @@ impl RenderPass for FoliagePlacePass {
             .unwrap_or(&self.placeholder_hiz_sampler);
         let type_buffer = ctx
             .scene_buffers
-            .get(BufferKey::of("foliage_types"))
+            .get(helio_foliage_api::FOLIAGE_TYPES.key())
             .map(|h| &h.buffer)
             .unwrap_or(&self.placeholder_type);
         let layer_buffer = ctx
             .scene_buffers
-            .get(BufferKey::of("foliage_layers"))
+            .get(helio_foliage_api::FOLIAGE_LAYERS.key())
             .map(|h| &h.buffer)
             .unwrap_or(&self.placeholder_layer);
         let place_key = (
@@ -1467,7 +1476,7 @@ impl RenderPass for FoliagePlacePass {
         if self.gather_rows > 0 {
             let source = ctx
                 .scene_buffers
-                .get(BufferKey::of("foliage_interactors"))
+                .get(helio_foliage_api::FOLIAGE_INTERACTORS.key())
                 .map(|h| &h.buffer)
                 .unwrap_or(&self.placeholder_interactor);
             if self

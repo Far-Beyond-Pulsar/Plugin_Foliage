@@ -3,72 +3,66 @@
 
 use engine_backend::scene::helio_bridge::SceneRowsRegistration;
 use engine_backend::scene::level_rules::LevelSingletonRegistration;
+use engine_backend::scene::{ClassSpec, ComponentsBuilder};
 use engine_backend::subsystems::render::{AnimatedContentRegistration, RenderFeatureRegistration};
 use foliage_component::{FoliageComponent, WIND_CLASS_NAME, WindComponent};
 use pulsar_settings::project::rendering::SettingsGroupRegistration;
 
-// ── Component classes ───────────────────────────────────────────────────────
+/// Everything the plugin registers for a game (and the editor).
+pub(crate) fn build(p: &mut pulsar_plugins::PluginBuilder) {
+    // ── Component classes ───────────────────────────────────────────────────
 
-pulsar_world_registry::submit_world_component!(FoliageComponent, WindComponent);
+    p.components()
+        .class::<FoliageComponent>(ClassSpec::default())
+        .class::<WindComponent>(ClassSpec::default());
 
-// ── Rendering ───────────────────────────────────────────────────────────────
+    // ── Rendering ───────────────────────────────────────────────────────────
 
-// Placement (before the G-buffer) and the foliage drawer, configured from the
-// project's foliage settings.
-inventory::submit! {
-    RenderFeatureRegistration {
-        origin: pulsar_plugins::origin!(),
+    // Placement (before the G-buffer) and the foliage drawer, configured from the
+    // project's foliage settings.
+    p.add(RenderFeatureRegistration {
+        origin: p.origin(),
         features: foliage_component::render_features,
         configure: foliage_component::configure_renderer,
-    }
-}
+    });
 
-// The foliage and wind source rows and the row join that places them.
-inventory::submit! {
-    SceneRowsRegistration {
-        origin: pulsar_plugins::origin!(),
+    // The foliage and wind source rows and the row join that places them.
+    p.add(SceneRowsRegistration {
+        origin: p.origin(),
         name: "foliage.foliage_and_wind",
         register_columns: foliage_component::register_columns,
         derivation: Some(foliage_component::derivation),
-    }
-}
+    });
 
-// Foliage in a wind faster than calm keeps a realtime viewport drawing. The
-// answer reads both components: re-checked when either changes.
-inventory::submit! {
-    AnimatedContentRegistration {
-        origin: pulsar_plugins::origin!(),
+    // Foliage in a wind faster than calm keeps a realtime viewport drawing. The
+    // answer reads both components: re-checked when either changes.
+    p.add(AnimatedContentRegistration {
+        origin: p.origin(),
         name: "foliage.foliage_changes",
         watch: |world| world.open_change_cursor::<FoliageComponent>(),
         animated: foliage_component::foliage_in_wind,
-    }
-}
+    });
 
-inventory::submit! {
-    AnimatedContentRegistration {
-        origin: pulsar_plugins::origin!(),
+    p.add(AnimatedContentRegistration {
+        origin: p.origin(),
         name: "foliage.wind_changes",
         watch: |world| world.open_change_cursor::<WindComponent>(),
         animated: foliage_component::foliage_in_wind,
-    }
-}
+    });
 
-// ── Settings ────────────────────────────────────────────────────────────────
+    // ── Settings ────────────────────────────────────────────────────────────
 
-// The project's foliage settings (`helio_pass_foliage_place::FOLIAGE`).
-inventory::submit! {
-    SettingsGroupRegistration {
-        origin: pulsar_plugins::origin!(),
+    // The project's foliage settings (`helio_pass_foliage_place::FOLIAGE`).
+    p.add(SettingsGroupRegistration {
+        origin: p.origin(),
         group: &helio_pass_foliage_place::FOLIAGE,
-    }
-}
+    });
 
-// ── Level rules ─────────────────────────────────────────────────────────────
+    // ── Level rules ─────────────────────────────────────────────────────────
 
-// A level has one global wind, edited in World Settings like the sky.
-inventory::submit! {
-    LevelSingletonRegistration {
-        origin: pulsar_plugins::origin!(),
+    // A level has one global wind, edited in World Settings like the sky.
+    p.add(LevelSingletonRegistration {
+        origin: p.origin(),
         class_name: WIND_CLASS_NAME,
         refusal: foliage_component::ONE_WIND,
         instances: foliage_component::winds,
@@ -77,7 +71,7 @@ inventory::submit! {
         default_is: true,
         enabled_only: false,
         edits_checked: false,
-    }
+    });
 }
 
 #[cfg(test)]
@@ -99,8 +93,7 @@ mod tests {
                 .any(|group| std::ptr::eq(*group, &helio_pass_foliage_place::FOLIAGE))
         );
         assert!(
-            inventory::iter::<LevelSingletonRegistration>
-                .into_iter()
+            pulsar_plugins::registered::<LevelSingletonRegistration>()
                 .any(|rule| rule.class_name == WIND_CLASS_NAME)
         );
     }

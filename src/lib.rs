@@ -7,8 +7,8 @@
 //! `helio-pass-foliage-gbuffer`: the G-buffer drawer), `foliage_component`
 //! (the foliage and wind components, their rows, row join and level rule)
 //! and `foliage_editor` (the level editor's Foliage mode and wind UI). None
-//! of them registers a contribution; this crate imports them and submits
-//! their registrations, so this file and the two modules below are the whole
+//! of them registers a contribution; this crate imports them and registers them
+//! through its [`build`], so this file and the two modules below are the whole
 //! list of what the plugin brings:
 //!
 //! - [`runtime`]: what a game links. The component classes, the Helio
@@ -19,7 +19,7 @@
 //!   Create entry and World Settings section.
 //!
 //! Every registration names this crate as its origin
-//! (`pulsar_plugins::origin!()`), so the plugin gate skips all of them while
+//! (`p.origin()`), so the plugin gate skips all of them while
 //! a project disables the plugin, and the plugin catalog lists them under
 //! `pulsar.foliage`. Other plugins never depend on this crate (only on
 //! `helio-foliage-api`); hosts reach it through the installed set or a
@@ -27,7 +27,15 @@
 
 // The plugin's descriptor (`pulsar-plugin.toml`): linking this crate installs
 // the plugin; a project enables it or not (`pulsar_plugins`).
-pulsar_plugins::installed!("pulsar-plugin.toml");
+pulsar_plugins::installed!("pulsar-plugin.toml", build);
+
+/// Everything the plugin registers (runtime always, editor with the `editor`
+/// feature).
+pub fn build(p: &mut pulsar_plugins::PluginBuilder) {
+    runtime::build(p);
+    #[cfg(feature = "editor")]
+    editor::build(p);
+}
 
 pub use foliage_component;
 #[cfg(feature = "editor")]
