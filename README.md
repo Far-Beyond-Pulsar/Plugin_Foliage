@@ -27,7 +27,7 @@ draw phases and api crates.
 | `helio-pass-foliage-gbuffer` | `feature/gbuffer/` | Helio render pass: foliage blade/card rasterisation into the G-buffer |
 | `helio-pass-foliage-place` | `feature/place/` | Foliage tile residency, GPU placement, tile/cluster culling and per-LOD compaction for Helio |
 
-- **Root crate**: `foliage_plugin`. It is the one place the plugin submits
+- **Root crate**: `foliage_plugin`. It is the one place the plugin registers
   its contributions (component classes, features, scene seams, settings,
   editor tools), each naming it as origin, so the plugin gate and the
   plugin catalog see all of them. The other crates submit none (only type
