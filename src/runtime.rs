@@ -5,7 +5,7 @@ use engine_backend::scene::helio_bridge::SceneRowsRegistration;
 use engine_backend::scene::level_rules::LevelSingletonRegistration;
 use engine_backend::scene::{ClassSpec, ComponentsBuilder};
 use engine_backend::subsystems::render::{AnimatedContentRegistration, RenderFeatureRegistration};
-use foliage_component::{FoliageComponent, WindComponent, WIND_CLASS_NAME};
+use foliage_component::{FoliageComponent, WIND_CLASS_NAME, WindComponent};
 use pulsar_settings::project::rendering::SettingsGroupRegistration;
 
 /// Everything the plugin registers for a game (and the editor).
@@ -87,11 +87,15 @@ mod tests {
             "features: {:?}",
             features.ids()
         );
-        assert!(pulsar_settings::project::rendering::groups()
-            .iter()
-            .any(|group| std::ptr::eq(*group, &helio_pass_foliage_place::FOLIAGE)));
-        assert!(pulsar_plugins::registered::<LevelSingletonRegistration>()
-            .any(|rule| rule.class_name == WIND_CLASS_NAME));
+        assert!(
+            pulsar_settings::project::rendering::groups()
+                .iter()
+                .any(|group| std::ptr::eq(*group, &helio_pass_foliage_place::FOLIAGE))
+        );
+        assert!(
+            pulsar_plugins::registered::<LevelSingletonRegistration>()
+                .any(|rule| rule.class_name == WIND_CLASS_NAME)
+        );
     }
 
     #[test]
@@ -110,9 +114,10 @@ mod tests {
             .into_iter()
             .filter(|summary| summary.origin == pulsar_plugins::origin!())
             .collect();
-        assert!(ours
-            .iter()
-            .any(|summary| summary.category == "component.class"));
+        assert!(
+            ours.iter()
+                .any(|summary| summary.category == "component.class")
+        );
         for summary in &ours {
             assert_eq!(
                 pulsar_plugins::plugin_of(summary.origin).map(|plugin| plugin.id.as_str()),
