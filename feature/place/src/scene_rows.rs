@@ -25,14 +25,14 @@ pub const MAX_FOLIAGE_TYPES: u32 = 64;
 
 /// A layer: a world-aligned square centred on its owner (`rows_layers.wgsl`).
 const LAYERS_PLACEMENT: Placement = Placement::new(
-    "foliage_layers",
+    helio_foliage_api::FOLIAGE_LAYERS.name(),
     include_str!("../shaders/rows_layers.wgsl"),
 )
 .from_owner();
 
-pub const FOLIAGE_TYPES_KEY: BufferKey = BufferKey::of("foliage_types");
-pub const FOLIAGE_LAYERS_KEY: BufferKey = BufferKey::of("foliage_layers");
-pub const FOLIAGE_WIND_KEY: BufferKey = BufferKey::of("foliage_wind");
+pub const FOLIAGE_TYPES_KEY: BufferKey = helio_foliage_api::FOLIAGE_TYPES.key();
+pub const FOLIAGE_LAYERS_KEY: BufferKey = helio_foliage_api::FOLIAGE_LAYERS.key();
+pub const FOLIAGE_WIND_KEY: BufferKey = helio_foliage_api::FOLIAGE_WIND.key();
 
 /// Where foliage's source rows live.
 #[derive(Clone, Copy, Debug)]
