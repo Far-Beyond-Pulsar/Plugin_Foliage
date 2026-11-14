@@ -86,6 +86,14 @@ struct DrawIndirect {
 @group(0) @binding(10) var hiz_samp: sampler;
 @group(0) @binding(11) var<storage, read> frames: array<TileFrame>;
 @group(0) @binding(12) var<uniform> foliage_bands: FoliageBands;
+// The frame's named stats (`helio_core::stats::FrameStats::buffer`), each
+// counter's slot compiled in (`FrameStats::slot_constants`); only
+// `cs_finalize` adds to them.
+@group(0) @binding(13) var<storage, read_write> stats: array<atomic<u32>>;
+override STAT_DRAW_CALLS: u32;
+override STAT_VERTICES: u32;
+override STAT_INSTANCES: u32;
+override STAT_BLADES: u32;
 
 var<workgroup> wg_planes: array<vec4<f32>, 5>;
 
@@ -409,4 +417,12 @@ fn cs_finalize(@builtin(local_invocation_index) lane: u32) {
     // `lod_region_offset`, not by the draw call, so that a single vertex shader can index
     // `visible_blades` with `instance_index` in every LOD.
     indirect[lane].first_instance = 0u;
+
+    // The frame's totals: a smooth LOD with blades in view is one draw.
+    atomicAdd(&stats[STAT_BLADES], instance_count);
+    if vertex_count > 0u && instance_count > 0u {
+        atomicAdd(&stats[STAT_DRAW_CALLS], 1u);
+        atomicAdd(&stats[STAT_VERTICES], vertex_count * instance_count);
+        atomicAdd(&stats[STAT_INSTANCES], instance_count);
+    }
 }

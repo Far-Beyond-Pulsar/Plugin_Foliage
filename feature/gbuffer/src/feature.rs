@@ -16,11 +16,13 @@ use crate::{FoliageBoxesPass, FoliageGBufferPass};
 pub fn foliage_passes(
     device: &wgpu::Device,
     settings: &FoliageSettings,
+    stats: &helio_core::FrameStats,
 ) -> (FoliagePlacePass, FoliageBoxesPass, FoliageGBufferPass) {
     let defaults = FoliageRange::default();
     let place = FoliagePlacePass::new_with(
         device,
         settings.quality,
+        stats,
         FoliageRange {
             range: settings.reach(),
             tufts_per_m2: settings.tufts_per_m2.unwrap_or(defaults.tufts_per_m2),
@@ -105,7 +107,7 @@ impl Feature for FoliageFeature {
                     }
                     // The boxes and the draw share placement's buffers: made here,
                     // they wait for the Foliage Boxes and Foliage GBuffer nodes.
-                    let (place, boxes, draw) = foliage_passes(build.env.device, &settings);
+                    let (place, boxes, draw) = foliage_passes(build.env.device, &settings, build.env.stats);
                     build.graph.add_pass(Box::new(place));
                     let pending = build.env.shared(PendingFoliage::default);
                     pending.boxes = Some(boxes);

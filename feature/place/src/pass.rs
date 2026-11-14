@@ -180,6 +180,8 @@ pub struct FoliagePlacePass {
     finalize_pipeline: wgpu::ComputePipeline,
 
     cull_bgl: wgpu::BindGroupLayout,
+    /// The frame stats' counters (`FrameStats::buffer`) the finalize adds to.
+    stats_buf: wgpu::Buffer,
     place_bind_group: Option<wgpu::BindGroup>,
     place_bind_group_key: Option<(wgpu::Buffer, wgpu::Buffer, wgpu::TextureView)>,
     cull_bind_group: Option<wgpu::BindGroup>,
@@ -231,10 +233,15 @@ pub struct FoliagePlacePass {
 
 impl FoliagePlacePass {
     /// Create the pass for `quality`'s range and the default density.
-    pub fn new(device: &wgpu::Device, quality: FoliageQuality) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        quality: FoliageQuality,
+        stats: &helio_core::FrameStats,
+    ) -> Self {
         Self::new_with(
             device,
             quality,
+            stats,
             FoliageRange {
                 range: quality.range(),
                 ..FoliageRange::default()
@@ -247,7 +254,12 @@ impl FoliagePlacePass {
     ///
     /// Nothing here grows: the band table fixes the slots, the slabs and so the arena, so
     /// there is no reallocation path and no bind-group versioning for our own buffers.
-    pub fn new_with(device: &wgpu::Device, quality: FoliageQuality, range: FoliageRange) -> Self {
+    pub fn new_with(
+        device: &wgpu::Device,
+        quality: FoliageQuality,
+        stats: &helio_core::FrameStats,
+        range: FoliageRange,
+    ) -> Self {
         let cluster_size = quality.cluster_granularity().max(1);
         let range = FoliageRange {
             range: if range.range.is_finite() && range.range > 0.0 {
@@ -524,6 +536,9 @@ impl FoliagePlacePass {
                 sampler_entry(10, wgpu::SamplerBindingType::NonFiltering),
                 storage_entry(11, true),
                 uniform_entry(12),
+                // The frame's named stats (`FrameStats::buffer`): the
+                // finalize lane adds each LOD's draw to them.
+                storage_entry(13, false),
             ],
         });
         let layout = |label: &str, bgl: &wgpu::BindGroupLayout| {
@@ -596,24 +611,39 @@ impl FoliagePlacePass {
             &place_shader,
             "cs_ground_plane",
         );
-        let tile_cull_pipeline = pipeline(
-            "Foliage Tile Cull Pipeline",
-            &cull_layout,
-            &cull_shader,
-            "cs_tile_cull",
-        );
-        let cluster_cull_pipeline = pipeline(
-            "Foliage Cluster Cull Pipeline",
-            &cull_layout,
-            &cull_shader,
-            "cs_cluster_cull",
-        );
-        let finalize_pipeline = pipeline(
-            "Foliage Finalize Pipeline",
-            &cull_layout,
-            &cull_shader,
-            "cs_finalize",
-        );
+        // The cull module's stats slots. The finalize lane writes each LOD's
+        // draw and adds it to the frame's shared draw, vertex and instance
+        // totals, and the blades to its own; every pipeline of the module
+        // gives its overrides their values.
+        let cull_constants = {
+            use helio_core::stats::{DRAW_CALLS, INSTANCES, VERTICES};
+            stats.slot_constants(&[
+                ("STAT_DRAW_CALLS", DRAW_CALLS),
+                ("STAT_VERTICES", VERTICES),
+                ("STAT_INSTANCES", INSTANCES),
+                ("STAT_BLADES", helio_foliage_api::stats::BLADES_DRAWN),
+            ])
+        };
+        let cull_pipeline = |label: &str, entry: &str| {
+            helio_core::shader::create_compute_pipeline(
+                &device,
+                wgpu::ComputePipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&cull_layout),
+                    module: &cull_shader,
+                    entry_point: Some(entry),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        constants: &cull_constants,
+                        ..Default::default()
+                    },
+                    cache: None,
+                },
+            )
+        };
+        let tile_cull_pipeline = cull_pipeline("Foliage Tile Cull Pipeline", "cs_tile_cull");
+        let cluster_cull_pipeline =
+            cull_pipeline("Foliage Cluster Cull Pipeline", "cs_cluster_cull");
+        let finalize_pipeline = cull_pipeline("Foliage Finalize Pipeline", "cs_finalize");
         let gather_pipeline = pipeline(
             "Foliage Interactors Pipeline",
             &gather_layout,
@@ -680,6 +710,7 @@ impl FoliagePlacePass {
             cluster_cull_pipeline,
             finalize_pipeline,
             cull_bgl,
+            stats_buf: stats.buffer().clone(),
             place_bind_group: None,
             place_bind_group_key: None,
             cull_bind_group: None,
@@ -1454,6 +1485,7 @@ impl RenderPass for FoliagePlacePass {
                     entry(10, wgpu::BindingResource::Sampler(hiz_sampler)),
                     entry(11, self.tile_frames.as_entire_binding()),
                     entry(12, self.bands_buffer.as_entire_binding()),
+                    entry(13, self.stats_buf.as_entire_binding()),
                 ],
             }));
             self.cull_bind_group_key = Some(key);

@@ -40,6 +40,7 @@ pub mod ground;
 pub mod packing;
 pub mod placement;
 pub mod quality;
+pub mod stats;
 
 pub use bands::*;
 pub use gpu_types::*;
