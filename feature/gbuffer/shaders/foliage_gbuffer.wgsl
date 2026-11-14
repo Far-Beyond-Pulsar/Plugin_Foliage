@@ -34,7 +34,7 @@
 //   1 normal       Rgba16Float  written
 //   2 orm          Rgba8Unorm   written
 //   3 emissive     Rgba16Float  written
-//   4 lightmap_uv  Rg16Float    written: (-1, -1.5), foliage's tag (no lightmap, no SSAO)
+//   4 surface      Rg16Float    written: (-1, -1.5), foliage's tag (no payload, no SSAO)
 //   5 sss          Rgba16Float  NOT written
 //   6 extra        Rgba16Float  NOT written
 //   7 velocity     Rgba16Float  written
@@ -922,9 +922,9 @@ fn vs_box(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) ins
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // The fragment writes the frame's `GBufferOutput` (`//!use gbuffer_output`).
-// `lightmap_uv` is `GBUFFER_TAG_OWN_OCCLUSION`, `(-1, -1.5)`: foliage's tag. Negative
-// x: no lightmap (the target's clear value `(0, 0)` would read as a lightmapped
-// surface); y -1.5 (clear of the voxel pass's -2 and of portal chains, below -2.5):
+// `surface` is `GBUFFER_TAG_OWN_OCCLUSION`, `(-1, -1.5)`: foliage's tag. Negative
+// x: a tag, not a surface payload; y -1.5 (clear of the voxel pass's -2 and of
+// portal chains, below -2.5):
 // the deferred pass leaves screen-space AO off it (dense blades overwhelm the kernel;
 // they carry their own height AO).
 
@@ -1004,6 +1004,6 @@ fn fs_main(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> GB
     // (helio-pass-tsr MOTION_VECTORS); still, it moves with the camera.
     out.velocity = vec4<f32>(foliage_velocity(input.clip_position.xy, input.prev_clip_position), 0.0,
         select(0.0, 1.0, input.moved > 0.0));
-    out.lightmap_uv = GBUFFER_TAG_OWN_OCCLUSION;
+    out.surface = GBUFFER_TAG_OWN_OCCLUSION;
     return out;
 }
