@@ -45,9 +45,8 @@
 //! value, so without the mask those G-buffer channels are filled with garbage wherever
 //! grass covers a pixel, and the deferred pass reads them everywhere.
 //!
-//! `lightmap_uv` *is* written: `(-1, -1.5)`, foliage's tag. Negative x is "no
-//! lightmap" (its clear value `(0, 0)` reads as a lightmap at the atlas's corner, and
-//! the deferred pass lit grass by that empty texel alone: black); y -1.5 (clear of the
+//! The surface channel *is* written: `(-1, -1.5)`, foliage's tag. Negative x is a tag,
+//! not a feature's surface payload; y -1.5 (clear of the
 //! voxel pass's -2 and of portal chains, below -2.5) keeps screen-space AO off grass,
 //! whose dense blades overwhelm the kernel (black fields) and which carries its own
 //! height AO.
@@ -747,8 +746,8 @@ impl RenderPass for FoliageGBufferPass {
             helio_core::ResourceKey::new(helio_frame_api::gbuffer::GROUP),
             "FoliageGBuffer",
         )?;
-        let lightmap_uv = resources.read(
-            helio_core::ResourceKey::new(helio_frame_api::gbuffer::LIGHTMAP_UV),
+        let surface_tag = resources.read(
+            helio_core::ResourceKey::new(helio_frame_api::gbuffer::SURFACE),
             "FoliageGBuffer",
         )?;
         let sss_target = resources.read(
@@ -801,7 +800,7 @@ impl RenderPass for FoliageGBufferPass {
                     ops: LOAD,
                 }),
                 Some(wgpu::RenderPassColorAttachment {
-                    view: lightmap_uv,
+                    view: surface_tag,
                     resolve_target: None,
                     depth_slice: None,
                     ops: LOAD,
