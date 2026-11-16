@@ -1006,13 +1006,13 @@ fn fs_main(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> GB
     // Metallic workflow, as `gbuffer.wgsl` resolves it: F0 = mix(0.04, albedo, metallic).
     let f0 = mix(vec3<f32>(FOLIAGE_F0), albedo, metallic);
     out.albedo = vec4<f32>(albedo, 1.0);
-    out.normal = vec4<f32>(helio_view_normal(cameras[0], normal), f0.r);
+    out.normal = vec4<f32>(normal, f0.r);
     out.orm = vec4<f32>(ao, roughness, metallic, f0.g);
     out.emissive = vec4<f32>(0.0, 0.0, 0.0, f0.b);
     // w: 1 where the blade moved by itself, in the wind or pushed aside
     // (helio-pass-tsr MOTION_VECTORS); still, it moves with the camera.
     out.velocity = vec4<f32>(foliage_velocity(input.clip_position.xy, input.prev_clip_position), 0.0,
         select(0.0, 1.0, input.moved > 0.0));
-    out.surface = gbuffer_view_tag(cameras[0], GBUFFER_TAG_OWN_OCCLUSION);
+    out.surface = GBUFFER_TAG_OWN_OCCLUSION;
     return out;
 }
