@@ -552,7 +552,13 @@ struct VertexOutput {
     /// (RGBA8; 0: none) with the height fraction it starts at (f32 bits).
     @location(10) @interpolate(flat) ground_colour: vec4<f32>,
     @location(11) @interpolate(flat) tip: vec2<u32>,
+    /// Where the fragment is in the view's space, for a clipped view's plane.
+    @location(12) world_position: vec3<f32>,
 }
+
+// Whether the view the pipeline draws has a clip plane
+// (`helio_frame_api::view::CLIP_CONSTANT`).
+override HELIO_VIEW_CLIP: bool = false;
 
 /// The vertex every position past a strip's end takes: all of them one point, a zero-area
 /// tail.
@@ -712,7 +718,8 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) in
     }
 
     var out: VertexOutput;
-    out.clip_position = cameras[0].view_proj * vec4<f32>(world_base + foliage_to_world(basis, sway_now) + bend, 1.0);
+    out.world_position = world_base + foliage_to_world(basis, sway_now) + bend;
+    out.clip_position = cameras[0].view_proj * vec4<f32>(out.world_position, 1.0);
     out.prev_clip_position = cameras[0].prev_view_proj * vec4<f32>(world_base + foliage_to_world(basis, sway_prev) + bend_prev, 1.0);
     out.moved = length(foliage_to_world(basis, sway_now - sway_prev) + bend - bend_prev);
     out.world_normal = foliage_to_world(basis, normal);
@@ -900,7 +907,8 @@ fn vs_box(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) ins
     let world = bx.centre + foliage_to_world(basis, corner.local);
     let ty = foliage_types[(bx.look >> 16u) & 0xffu];
     var out: VertexOutput;
-    out.clip_position = cameras[0].view_proj * vec4<f32>(world + bx.now, 1.0);
+    out.world_position = world + bx.now;
+    out.clip_position = cameras[0].view_proj * vec4<f32>(out.world_position, 1.0);
     out.prev_clip_position = cameras[0].prev_view_proj * vec4<f32>(world + bx.prev, 1.0);
     out.moved = length(bx.now - bx.prev);
     // A blocky shape lights as the ground it grows on, its faces telling apart.
@@ -939,6 +947,7 @@ fn foliage_velocity(clip_position: vec2<f32>, prev_clip: vec4<f32>) -> vec2<f32>
 
 @fragment
 fn fs_main(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> GBufferOutput {
+    if HELIO_VIEW_CLIP && helio_view_clipped(cameras[0], input.world_position) { discard; }
     // ── Colour ────────────────────────────────────────────────────────────────
     // The type's authored colour (a multiplier on the ground's for ground-coloured types,
     // so grass is the turf's colour), else the procedural root-to-tip green; varied per
@@ -997,13 +1006,13 @@ fn fs_main(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> GB
     // Metallic workflow, as `gbuffer.wgsl` resolves it: F0 = mix(0.04, albedo, metallic).
     let f0 = mix(vec3<f32>(FOLIAGE_F0), albedo, metallic);
     out.albedo = vec4<f32>(albedo, 1.0);
-    out.normal = vec4<f32>(normal, f0.r);
+    out.normal = vec4<f32>(helio_view_normal(cameras[0], normal), f0.r);
     out.orm = vec4<f32>(ao, roughness, metallic, f0.g);
     out.emissive = vec4<f32>(0.0, 0.0, 0.0, f0.b);
     // w: 1 where the blade moved by itself, in the wind or pushed aside
     // (helio-pass-tsr MOTION_VECTORS); still, it moves with the camera.
     out.velocity = vec4<f32>(foliage_velocity(input.clip_position.xy, input.prev_clip_position), 0.0,
         select(0.0, 1.0, input.moved > 0.0));
-    out.surface = GBUFFER_TAG_OWN_OCCLUSION;
+    out.surface = gbuffer_view_tag(cameras[0], GBUFFER_TAG_OWN_OCCLUSION);
     return out;
 }
