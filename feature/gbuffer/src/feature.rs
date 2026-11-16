@@ -17,6 +17,7 @@ pub fn foliage_passes(
     device: &wgpu::Device,
     settings: &FoliageSettings,
     stats: &helio_core::FrameStats,
+    view: helio_core::ViewDescription,
 ) -> (FoliagePlacePass, FoliageBoxesPass, FoliageGBufferPass) {
     let defaults = FoliageRange::default();
     let place = FoliagePlacePass::new_with(
@@ -39,6 +40,7 @@ pub fn foliage_passes(
         Arc::clone(&place.foliage_indirect),
         Arc::clone(&place.bands_buffer),
         Arc::clone(&place.interactors),
+        view,
     );
     draw.quality = settings.quality;
     let boxes = draw.boxes_pass(device);
@@ -107,7 +109,12 @@ impl Feature for FoliageFeature {
                     }
                     // The boxes and the draw share placement's buffers: made here,
                     // they wait for the Foliage Boxes and Foliage GBuffer nodes.
-                    let (place, boxes, draw) = foliage_passes(build.env.device, &settings, build.env.stats);
+                    let (place, boxes, draw) = foliage_passes(
+                        build.env.device,
+                        &settings,
+                        build.env.stats,
+                        helio_frame_api::view::view_of(build.env),
+                    );
                     build.graph.add_pass(Box::new(place));
                     let pending = build.env.shared(PendingFoliage::default);
                     pending.boxes = Some(boxes);

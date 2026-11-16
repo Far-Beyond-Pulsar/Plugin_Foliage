@@ -471,6 +471,7 @@ impl FoliageGBufferPass {
         foliage_indirect: Arc<wgpu::Buffer>,
         bands: Arc<wgpu::Buffer>,
         interactors: Arc<wgpu::Buffer>,
+        view: helio_core::ViewDescription,
     ) -> Self {
         // ── Region stride ─────────────────────────────────────────────────────
         // Derived from the buffer the producer sized, so there is no third place for
@@ -594,11 +595,22 @@ impl FoliageGBufferPass {
                     fragment: Some(wgpu::FragmentState {
                         module: &shader,
                         entry_point: Some("fs_main"),
-                        compilation_options: Default::default(),
+                        // The view's clip (`helio_frame_api::view`): compiled in
+                        // only where the view has one.
+                        compilation_options: wgpu::PipelineCompilationOptions {
+                            constants: &[(
+                                helio_frame_api::view::CLIP_CONSTANT,
+                                if view.clipped { 1.0 } else { 0.0 },
+                            )],
+                            ..Default::default()
+                        },
                         targets: &targets,
                     }),
                     primitive: wgpu::PrimitiveState {
                         topology: wgpu::PrimitiveTopology::TriangleStrip,
+                        // The view's winding: `front_facing` (which side of a
+                        // blade lights) follows a mirrored view.
+                        front_face: view.front_face(),
                         // No effect on a non-indexed draw, but on Vulkan a `Some` value sets
                         // `primitiveRestartEnable`, and `None` is the correct state here.
                         strip_index_format: None,
