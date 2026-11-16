@@ -1,5 +1,6 @@
 //!use helio_prelude
 //!use helio_foliage_common
+//!use portal_chain
 // Foliage tile cull, cluster cull + compaction, and indirect finalize — stages 2 and 3
 // of `FoliagePlacePass`.
 //
@@ -62,7 +63,8 @@ struct FoliageCullUniforms {
     /// and the consumer decides their blend weights. A mismatch leaves instances that
     /// blend to less (gap) or more (double-density ring) than one blade's coverage.
     lod_fade_band:          f32,
-    _pad0:                  u32,
+    /// Live portal chains this frame: the `cs_*_chains` dispatches' chain dimension.
+    chain_count:            u32,
 }
 
 /// Mirrors `wgpu::util::DrawIndirectArgs` (16 bytes).
@@ -95,6 +97,24 @@ override STAT_VERTICES: u32;
 override STAT_INSTANCES: u32;
 override STAT_BLADES: u32;
 
+// ── What portal chains show (`cs_*_chains`) ──────────────────────────────────
+//
+// A chain draws the tiles of the eye set it was given (`FoliageChainView::eye_set`), culled
+// in its content's world: the frustum mapped back through the chain, the band distances
+// from the camera's place there, and only what lies beyond every opening of its route.
+// No Hi-Z: the frame's pyramid holds the walls the openings are cut in.
+@group(1) @binding(0) var<storage, read> portal_chains: array<GpuPortalChain>;
+@group(1) @binding(1) var<storage, read> portal_stages: array<GpuPortalStage>;
+@group(1) @binding(2) var<storage, read> chain_views: array<FoliageChainView>;
+// The occurrences: references packed as `visible_blades`' in a region per LOD, each
+// one's chain alongside, the per-LOD counts (then the overflow) and the four draws.
+@group(1) @binding(3) var<storage, read_write> occurrence_blades: array<u32>;
+@group(1) @binding(4) var<storage, read_write> occurrence_chains: array<u32>;
+@group(1) @binding(5) var<storage, read_write> occurrence_counters: array<atomic<u32>>;
+@group(1) @binding(6) var<storage, read_write> occurrence_indirect: array<DrawIndirect>;
+// Each chain's tile visibility: `chain * tile_count + slot` (slot in its eye set).
+@group(1) @binding(7) var<storage, read_write> occurrence_tiles: array<u32>;
+
 var<workgroup> wg_planes: array<vec4<f32>, 5>;
 
 // ── Shared helpers ──────────────────────────────────────────────────────────────
@@ -121,6 +141,30 @@ fn publish_frustum_planes() {
     wg_planes[2] = p2 / length(p2.xyz);
     wg_planes[3] = p3 / length(p3.xyz);
     wg_planes[4] = p4 / length(p4.xyz);
+}
+
+/// The frustum planes in `chain`'s content: a content point `p` drawn at
+/// `content_to_drawn * p` is inside plane `n` exactly where `transpose(content_to_drawn) * n`
+/// holds `p` (the map is rigid, so the normals stay unit length).
+fn publish_chain_planes(chain: GpuPortalChain) {
+    publish_frustum_planes();
+    let to_content = transpose(chain.content_to_drawn);
+    for (var i = 0u; i < 5u; i++) {
+        let plane = to_content * wg_planes[i];
+        wg_planes[i] = plane / length(plane.xyz);
+    }
+}
+
+/// Whether a sphere in `chain`'s content may show through it: not wholly on the camera's
+/// side of any opening of its route.
+fn chain_reaches(chain: GpuPortalChain, center: vec3<f32>, radius: f32) -> bool {
+    for (var s = 0u; s < chain.stage_count; s++) {
+        let local = portal_stages[chain.first_stage + s].content_to_local * vec4<f32>(center, 1.0);
+        if local.z < -radius {
+            return false;
+        }
+    }
+    return true;
 }
 
 fn sphere_visible(center: vec3<f32>, radius: f32) -> bool {
@@ -204,28 +248,73 @@ fn cs_tile_cull(
         return;
     }
 
-    let tile = tiles[slot];
+    let bounds = tile_bounds(slot, cameras[0].position_near.xyz);
     var visible = 0u;
-    if (tile.state == TILE_STATE_RESIDENT || tile.state == TILE_STATE_EVICTING)
-        && tile.blade_count > 0u
+    if bounds.w > 0.0 && sphere_visible(bounds.xyz, bounds.w) && !hiz_occluded(bounds.xyz, bounds.w) {
+        visible = 1u;
+    }
+    tile_visible[slot] = visible;
+}
+
+/// Tile `slot`'s bounding sphere (xyz centre, w radius), or w 0 where it draws nothing
+/// seen from `eye`: not resident, empty, or outside its band's distances.
+fn tile_bounds(slot: u32, eye: vec3<f32>) -> vec4<f32> {
+    let tile = tiles[slot];
+    if !((tile.state == TILE_STATE_RESIDENT || tile.state == TILE_STATE_EVICTING)
+        && tile.blade_count > 0u)
     {
-        let frame = frames[slot];
-        let band = foliage_bands.bands[foliage_band_of_slot(slot)];
-        let center = frame.origin + (frame.axis_u + frame.axis_v) * 0.5 + frame.up * tile.bounds_center;
-        // Dilate by the tallest foliage plus its wind displacement before testing.
-        // Under-dilating here is the classic wind-culling bug: blades blow outside the
-        // tile bounds and the tile is culled while its geometry is still on screen.
-        let radius = 0.5 * max(length(frame.axis_u + frame.axis_v), length(frame.axis_u - frame.axis_v))
-            + tile.bounds_half + cull.max_foliage_height + cull.wpo_extent;
-        // Only the tiles reaching into their band's distances draw: the inner tiles of a
-        // far band's ring lie under the nearer bands.
-        let d = length(center - cameras[0].position_near.xyz);
-        let in_band = d + radius > band.inner - band.fade_in && d - radius < band.outer;
-        if in_band && sphere_visible(center, radius) && !hiz_occluded(center, radius) {
+        return vec4<f32>(0.0);
+    }
+    let frame = frames[slot];
+    let band = foliage_bands.bands[foliage_band_of_slot(slot)];
+    let center = frame.origin + (frame.axis_u + frame.axis_v) * 0.5 + frame.up * tile.bounds_center;
+    // Dilate by the tallest foliage plus its wind displacement before testing.
+    // Under-dilating here is the classic wind-culling bug: blades blow outside the
+    // tile bounds and the tile is culled while its geometry is still on screen.
+    let radius = 0.5 * max(length(frame.axis_u + frame.axis_v), length(frame.axis_u - frame.axis_v))
+        + tile.bounds_half + cull.max_foliage_height + cull.wpo_extent;
+    // Only the tiles reaching into their band's distances draw: the inner tiles of a
+    // far band's ring lie under the nearer bands.
+    let d = length(center - eye);
+    let in_band = d + radius > band.inner - band.fade_in && d - radius < band.outer;
+    return select(vec4<f32>(0.0), vec4<f32>(center, radius), in_band);
+}
+
+/// What portal chains show, stage 2a: chain `workgroup_id.y`'s tiles of its eye set.
+@compute @workgroup_size(64)
+fn cs_tile_cull_chains(
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(local_invocation_index) lane: u32,
+) {
+    let chain_index = workgroup_id.y;
+    if chain_index >= cull.chain_count || chain_index >= arrayLength(&portal_chains)
+        || chain_index >= arrayLength(&chain_views)
+    {
+        return;
+    }
+    let chain = portal_chains[chain_index];
+    if lane == 0u {
+        publish_chain_planes(chain);
+    }
+    workgroupBarrier();
+
+    let local = workgroup_id.x * WG_SIZE + lane;
+    let out_index = chain_index * cull.tile_count + local;
+    if local >= cull.tile_count || out_index >= arrayLength(&occurrence_tiles) {
+        return;
+    }
+    let view = chain_views[chain_index];
+    var visible = 0u;
+    let slot = view.eye_set * cull.tile_count + local;
+    if view.eye_set != FOLIAGE_NO_EYE_SET && slot < arrayLength(&tiles) {
+        let bounds = tile_bounds(slot, view.eye);
+        if bounds.w > 0.0 && sphere_visible(bounds.xyz, bounds.w)
+            && chain_reaches(chain, bounds.xyz, bounds.w)
+        {
             visible = 1u;
         }
     }
-    tile_visible[slot] = visible;
+    occurrence_tiles[out_index] = visible;
 }
 
 // ── Stage 2b: cluster cull + per-LOD compaction ─────────────────────────────────
@@ -253,16 +342,30 @@ fn cs_cluster_cull(
         return;
     }
 
+    let kept = cluster_records(slot, cluster, cameras[0].position_near.xyz, true);
+    if kept.x != 0u {
+        emit_cluster(kept.y, kept.x, slot, kept.w);
+        if kept.z < FOLIAGE_LOD_COUNT {
+            emit_cluster(kept.z, kept.x, slot, kept.w);
+        }
+    }
+}
+
+/// Cluster `cluster` of tile `slot` seen from `eye`, in the frustum held in `wg_planes`
+/// (and past the Hi-Z where `occlusion`): x the records that draw (a bit each), y its
+/// LOD, z a second LOD it is also emitted at (`FOLIAGE_LOD_NONE`: none), w its first
+/// record; x 0 where nothing draws.
+fn cluster_records(slot: u32, cluster: u32, eye: vec3<f32>, occlusion: bool) -> vec4<u32> {
+    let nothing = vec4<u32>(0u, 0u, FOLIAGE_LOD_NONE, 0u);
     let tile = tiles[slot];
     let frame = frames[slot];
     let cluster_size = max(cull.cluster_size, 1u);
     let first = cluster * cluster_size;
     if first >= tile.blade_count {
-        return;
+        return nothing;
     }
     let count = min(cluster_size, tile.blade_count - first);
     let band = foliage_bands.bands[foliage_band_of_slot(slot)];
-    let eye = cameras[0].position_near.xyz;
 
     // Real per-cluster bounds, read from the records. The alternative — reusing the tile's
     // bounds — makes cluster culling exactly as precise as tile culling, i.e. useless.
@@ -280,7 +383,7 @@ fn cs_cluster_cull(
         sampled = sampled + 1u;
     }
     if sampled == 0u {
-        return;
+        return nothing;
     }
 
     let center = (bounds_min + bounds_max) * 0.5;
@@ -288,10 +391,10 @@ fn cs_cluster_cull(
     let radius = length(bounds_max - center) + dilate;
 
     if !sphere_visible(center, radius) {
-        return;
+        return nothing;
     }
-    if hiz_occluded(center, radius) {
-        return;
+    if occlusion && hiz_occluded(center, radius) {
+        return nothing;
     }
 
     // The band decides the LOD: the near band's blades at L0 or L1 (by the cluster's
@@ -325,12 +428,82 @@ fn cs_cluster_cull(
             keep_mask = keep_mask | (1u << i);
         }
     }
-    if keep_mask == 0u {
+    return vec4<u32>(keep_mask, lod, second, first);
+}
+
+/// What portal chains show, stage 2b: chain `workgroup_id.z`'s visible tiles' clusters,
+/// into the occurrences with the chain beside each record.
+@compute @workgroup_size(64)
+fn cs_cluster_cull_chains(
+    @builtin(workgroup_id) workgroup_id: vec3<u32>,
+    @builtin(local_invocation_index) lane: u32,
+) {
+    let chain_index = workgroup_id.z;
+    if chain_index >= cull.chain_count || chain_index >= arrayLength(&portal_chains)
+        || chain_index >= arrayLength(&chain_views)
+    {
         return;
     }
-    emit_cluster(lod, keep_mask, slot, first);
-    if second < FOLIAGE_LOD_COUNT {
-        emit_cluster(second, keep_mask, slot, first);
+    let chain = portal_chains[chain_index];
+    if lane == 0u {
+        publish_chain_planes(chain);
+    }
+    workgroupBarrier();
+
+    let group = workgroup_id.x + workgroup_id.y * max(cull.cluster_dispatch_width, 1u);
+    let index = group * WG_SIZE + lane;
+    let clusters_per_tile = max(cull.clusters_per_tile, 1u);
+    let local = index / clusters_per_tile;
+    let cluster = index - local * clusters_per_tile;
+    let visibility = chain_index * cull.tile_count + local;
+    if local >= cull.tile_count || visibility >= arrayLength(&occurrence_tiles)
+        || occurrence_tiles[visibility] == 0u
+    {
+        return;
+    }
+    let view = chain_views[chain_index];
+    let slot = view.eye_set * cull.tile_count + local;
+    if slot >= arrayLength(&tiles) {
+        return;
+    }
+    let kept = cluster_records(slot, cluster, view.eye, false);
+    if kept.x != 0u {
+        emit_occurrence(kept.y, kept.x, slot, kept.w, chain_index);
+        if kept.z < FOLIAGE_LOD_COUNT {
+            emit_occurrence(kept.z, kept.x, slot, kept.w, chain_index);
+        }
+    }
+}
+
+/// [`emit_cluster`] into the occurrences: the kept records of one cluster (`mask`) for one
+/// LOD, each with its chain. The regions split the buffer evenly per LOD.
+fn emit_occurrence(lod: u32, mask: u32, slot: u32, first: u32, chain: u32) {
+    let emit = countOneBits(mask);
+    let capacity = arrayLength(&occurrence_blades) / FOLIAGE_LOD_COUNT;
+    let base = atomicAdd(&occurrence_counters[lod], emit);
+    if base >= capacity {
+        atomicAdd(&occurrence_counters[FOLIAGE_LOD_COUNT], emit);
+        return;
+    }
+    let writable = min(emit, capacity - base);
+    if writable < emit {
+        atomicAdd(&occurrence_counters[FOLIAGE_LOD_COUNT], emit - writable);
+    }
+    let region = lod * capacity;
+    var written = 0u;
+    var bits = mask;
+    loop {
+        if bits == 0u || written >= writable {
+            break;
+        }
+        let i = firstTrailingBit(bits);
+        bits = bits & (bits - 1u);
+        let out_index = region + base + written;
+        if out_index < arrayLength(&occurrence_chains) {
+            occurrence_blades[out_index] = (slot << 16u) | ((first + i) & 0xffffu);
+            occurrence_chains[out_index] = chain;
+        }
+        written = written + 1u;
     }
 }
 
@@ -387,26 +560,7 @@ fn cs_finalize(@builtin(local_invocation_index) lane: u32) {
     // as boxes the draw expands from these same instances. Written as a branch rather than
     // a const array because indexing a `const` array with a runtime value is not portable
     // across WGSL front-ends.
-    var vertex_count = 13u;
-    if lane == 0u {
-        vertex_count = 11u;
-    } else if lane == 1u {
-        vertex_count = 7u;
-    } else if lane == 2u {
-        vertex_count = 88u;
-    }
-    var any_smooth = false;
-    let rows = min(cull.type_count, arrayLength(&types));
-    for (var t = 0u; t < rows; t++) {
-        if (types[t].kind_and_flags & 0xffu) != FOLIAGE_KIND_BLOCK && types[t].density > 0.0 {
-            any_smooth = true;
-            break;
-        }
-    }
-    if !any_smooth {
-        vertex_count = 0u;
-    }
-
+    let vertex_count = lod_vertex_count(lane);
     let raw = atomicLoad(&counters[lane]);
     let instance_count = min(raw, cull.per_lod_capacity);
 
@@ -425,4 +579,40 @@ fn cs_finalize(@builtin(local_invocation_index) lane: u32) {
         atomicAdd(&stats[STAT_VERTICES], vertex_count * instance_count);
         atomicAdd(&stats[STAT_INSTANCES], instance_count);
     }
+}
+
+/// Smooth foliage's strip at LOD `lod` (FOLIAGE_LOD_VERTEX_COUNTS), a `TriangleStrip` with
+/// no vertex or index buffer; none without a smooth type. Blocky foliage is drawn as boxes
+/// the draw expands from the same instances. A branch rather than a const array because
+/// indexing a `const` array with a runtime value is not portable across WGSL front-ends.
+fn lod_vertex_count(lod: u32) -> u32 {
+    var vertex_count = 13u;
+    if lod == 0u {
+        vertex_count = 11u;
+    } else if lod == 1u {
+        vertex_count = 7u;
+    } else if lod == 2u {
+        vertex_count = 88u;
+    }
+    let rows = min(cull.type_count, arrayLength(&types));
+    for (var t = 0u; t < rows; t++) {
+        if (types[t].kind_and_flags & 0xffu) != FOLIAGE_KIND_BLOCK && types[t].density > 0.0 {
+            return vertex_count;
+        }
+    }
+    return 0u;
+}
+
+/// What portal chains show, stage 3: the occurrences' counts into their four draws (the
+/// frame's stats count the frame's own draws).
+@compute @workgroup_size(4)
+fn cs_finalize_chains(@builtin(local_invocation_index) lane: u32) {
+    if lane >= FOLIAGE_LOD_COUNT || lane >= arrayLength(&occurrence_indirect) {
+        return;
+    }
+    let capacity = arrayLength(&occurrence_blades) / FOLIAGE_LOD_COUNT;
+    occurrence_indirect[lane].vertex_count = lod_vertex_count(lane);
+    occurrence_indirect[lane].instance_count = min(atomicLoad(&occurrence_counters[lane]), capacity);
+    occurrence_indirect[lane].first_vertex = 0u;
+    occurrence_indirect[lane].first_instance = 0u;
 }

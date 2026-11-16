@@ -1,6 +1,6 @@
 //! Uniform blocks shared with `shaders/foliage_place.wgsl` and `shaders/foliage_cull.wgsl`.
 //!
-//! Both are plain scalars (80 and 64 bytes), and both sizes are pinned by a `const _` assert. A
+//! Both are plain scalars (64 bytes each), and both sizes are pinned by a `const _` assert. A
 //! size or field-order change that the WGSL does not
 //! follow does not fail loudly: the shader reads every field after the change from the
 //! wrong offset, and the symptom is grass at the wrong density in the wrong places, which
@@ -15,7 +15,7 @@
 use bytemuck::{Pod, Zeroable};
 
 /// Per-frame constants for the placement dispatches (`cs_query`, `cs_ground_plane`,
-/// `cs_place`). Exactly 80 bytes. Each tile's own constants (its size, candidate grid,
+/// `cs_place`). Exactly 64 bytes. Each tile's own constants (its size, candidate grid,
 /// density share, slab) come from its band ([`crate::GpuFoliageBands`]).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, Pod, Zeroable)]
@@ -66,13 +66,10 @@ pub struct PlaceUniforms {
     pub search_above: f32,
     /// ...to this far under it.
     pub search_below: f32,
-    /// The eye in render space.
-    pub eye: [f32; 3],
     /// Parts (a workgroup's share of a tile's candidates) of the tiles placed, then of
     /// the tiles queried.
     pub place_part_count: u32,
     pub query_part_count: u32,
-    pub _pad: u32,
 }
 
 /// Per-frame constants for the tile cull, cluster cull and finalize dispatches.
@@ -125,13 +122,14 @@ pub struct FoliageCullUniforms {
 
     /// Reserved. Must be written as zero.
     pub lod_fade_band: f32,
-    pub _pad: [u32; 1],
+    /// Live portal chains this frame (the occurrence cull's chain dimension).
+    pub chain_count: u32,
 }
 
 const _: () = {
     assert!(
-        std::mem::size_of::<PlaceUniforms>() == 80,
-        "PlaceUniforms must be exactly 80 bytes to match foliage_place.wgsl"
+        std::mem::size_of::<PlaceUniforms>() == 64,
+        "PlaceUniforms must be exactly 64 bytes to match foliage_place.wgsl"
     );
     assert!(
         std::mem::size_of::<FoliageCullUniforms>() == 64,
@@ -145,7 +143,7 @@ mod tests {
 
     #[test]
     fn uniform_sizes_are_stable() {
-        assert_eq!(std::mem::size_of::<PlaceUniforms>(), 80);
+        assert_eq!(std::mem::size_of::<PlaceUniforms>(), 64);
         assert_eq!(std::mem::size_of::<FoliageCullUniforms>(), 64);
         assert_eq!(std::mem::align_of::<PlaceUniforms>(), 4);
         assert_eq!(std::mem::align_of::<FoliageCullUniforms>(), 4);
@@ -183,7 +181,8 @@ mod tests {
         assert_eq!(at(u(&value.layer_count)), 44);
         assert_eq!(at(f(&value.search_above)), 48);
         assert_eq!(at(f(&value.search_below)), 52);
-        assert_eq!(at(value.eye.as_ptr() as *const u8), 56);
+        assert_eq!(at(u(&value.place_part_count)), 56);
+        assert_eq!(at(u(&value.query_part_count)), 60);
     }
 
     #[test]
@@ -234,12 +233,12 @@ mod tests {
             offset_of(&value.lod_fade_band as *const f32 as *const u8),
             56
         );
-        assert_eq!(offset_of(value._pad.as_ptr() as *const u8), 60);
+        assert_eq!(offset_of(&value.chain_count as *const u32 as *const u8), 60);
     }
 
     #[test]
     fn reserved_padding_defaults_to_zero() {
         assert_eq!(PlaceUniforms::default().layer_count, 0);
-        assert_eq!(FoliageCullUniforms::default()._pad, [0; 1]);
+        assert_eq!(FoliageCullUniforms::default().chain_count, 0);
     }
 }

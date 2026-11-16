@@ -75,14 +75,9 @@ struct PlaceUniforms {
     /// it it ends.
     search_above:       f32,
     search_below:       f32,
-    eye_x:              f32,
-    eye_y:              f32,
-
-    eye_z:              f32,
     /// Parts (`parts`) of the tiles placed, then of the tiles queried.
     place_part_count:   u32,
     query_part_count:   u32,
-    _pad0:              u32,
 }
 
 /// Mirrors `crate::GpuFoliageLayer` (Rust, 32 bytes).
@@ -112,6 +107,13 @@ struct FoliageLayer {
 /// Per placed tile (by queue entry): its ground's lowest and highest heights (`ordered`)
 /// and its records so far.
 @group(0) @binding(15) var<storage, read_write> place_scratch: array<atomic<i32>>;
+// Each eye set's eye (frame space, xyz): a tile's queries start over its own set's.
+@group(0) @binding(16) var<storage, read> set_eyes: array<vec4<f32>>;
+
+/// The eye of the eye set `slot` belongs to (`foliage_set_of_slot`).
+fn set_eye(slot: u32) -> vec3<f32> {
+    return set_eyes[min(foliage_set_of_slot(slot), arrayLength(&set_eyes) - 1u)].xyz;
+}
 
 var<workgroup> wg_scan: array<u32, WG_SIZE>;
 var<workgroup> wg_base: u32;
@@ -370,7 +372,7 @@ fn cs_query(
     let band = foliage_bands.bands[band_index];
     let generation = band_generation(tile.generation, band_index);
     // Every query of the tile starts the same height over its datum: the eye's, raised.
-    let eye_h = dot(vec3<f32>(place.eye_x, place.eye_y, place.eye_z) - frame.origin, frame.up);
+    let eye_h = dot(set_eye(entry.slot) - frame.origin, frame.up);
     let start_h = eye_h + place.search_above;
     let length = place.search_above + place.search_below;
     let cubes = cube_cells(frame);
@@ -519,7 +521,7 @@ fn cs_place_bounds(@builtin(workgroup_id) workgroup_id: vec3<u32>, @builtin(loca
         return;
     }
     let frame = frames[tile.slot];
-    let eye_h = dot(vec3<f32>(place.eye_x, place.eye_y, place.eye_z) - frame.origin, frame.up);
+    let eye_h = dot(set_eye(tile.slot) - frame.origin, frame.up);
     let start_h = eye_h + place.search_above;
     let length = place.search_above + place.search_below;
     var low = 3.0e38;
@@ -572,7 +574,7 @@ fn cs_place(
     let band_index = foliage_band_of_slot(slot);
     let band = foliage_bands.bands[band_index];
     let generation = band_generation(tile.generation, band_index);
-    let eye_h = dot(vec3<f32>(place.eye_x, place.eye_y, place.eye_z) - frame.origin, frame.up);
+    let eye_h = dot(set_eye(slot) - frame.origin, frame.up);
     let start_h = eye_h + place.search_above;
     let length = place.search_above + place.search_below;
     let cubes = cube_cells(frame);

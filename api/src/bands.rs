@@ -298,8 +298,10 @@ impl GpuFoliageBands {
             .sum()
     }
 
-    /// The band a slot belongs to.
+    /// The band a slot belongs to (in its eye set: the tile table holds one
+    /// set of [`Self::slots`] per eye foliage keeps resident around).
     pub fn band_of_slot(&self, slot: u32) -> Option<usize> {
+        let slot = slot % self.slots().max(1);
         self.bands()
             .iter()
             .position(|b| slot >= b.slot_base && slot < b.slot_base + b.slot_count)

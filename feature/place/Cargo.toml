@@ -19,6 +19,9 @@ pulsar_reflection = { workspace = true }
 glam = { workspace = true }
 helio-core = { workspace = true }
 helio-foliage-api = { workspace = true }
+# What portals show (`PORTAL_LIVE_CHAINS`, the chains' rows): foliage keeps
+# it resident and culls it per chain.
+helio-portal-api = { workspace = true }
 wgpu = { workspace = true }
 bytemuck = { workspace = true, features = ["derive"] }
 log = { workspace = true }

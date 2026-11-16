@@ -52,11 +52,27 @@ const MAX_FOLIAGE_HEIGHT: f32 = 1.5;
 /// slot still holds it.
 #[derive(Clone, Copy, Debug)]
 struct Asked {
+    /// Its eye set.
+    set: usize,
     band: usize,
     slot: u32,
     coord: [i32; 2],
     /// Its first query.
     first: u32,
+}
+
+/// One place foliage keeps resident around: the bands' rings around an eye, on the
+/// ground's chart there. Set 0 follows the camera; the others follow what portal chains
+/// show (`helio_portal_api::PORTAL_LIVE_CHAINS`), each holding its own slots and slabs
+/// (one set of the band table after another in the tile table and the arena).
+struct EyeSet {
+    rings: Vec<TileRing>,
+    /// The chart its resident tiles lie on.
+    chart: Option<u64>,
+    /// The world eye its rings follow; `None` until it first follows one.
+    eye: Option<DVec3>,
+    /// The route it follows (a set after the first), while that route is live.
+    key: Option<u64>,
 }
 
 /// Hard ceiling on the foliage type table.
@@ -123,6 +139,31 @@ pub struct FoliagePlacePass {
     /// render space, for the draw: a count, then at most [`FOLIAGE_MAX_INTERACTORS`]
     /// rows of [`INTERACTOR_BYTES`] (`Interactors` in foliage_interactors.wgsl).
     pub interactors: Arc<wgpu::Buffer>,
+
+    /// What portals show (`helio_portal_api`): per live chain (a row per row of
+    /// `PORTAL_CHAINS`) the camera in its content and the eye set it draws
+    /// ([`crate::GpuChainView`]); the records the chains show, packed as
+    /// [`Self::visible_blades`]' and a region of [`crate::FOLIAGE_OCCURRENCES_PER_LOD`]
+    /// per LOD, with each one's chain alongside; and their four draws.
+    pub chain_views: Arc<wgpu::Buffer>,
+    pub occurrence_blades: Arc<wgpu::Buffer>,
+    pub occurrence_chains: Arc<wgpu::Buffer>,
+    pub occurrence_indirect: Arc<wgpu::Buffer>,
+    /// The occurrences' per-LOD counts and overflow, each chain's tile visibility
+    /// (`chain * slots_per_set + slot`), and each eye set's eye (frame space) for
+    /// placement's ground queries.
+    occurrence_counters: wgpu::Buffer,
+    occurrence_tiles: wgpu::Buffer,
+    set_eyes: wgpu::Buffer,
+    occurrence_bgl: wgpu::BindGroupLayout,
+    /// Rebuilt when the portals' chain or stage buffer is replaced (they grow).
+    occurrence_bind_group: Option<(wgpu::Buffer, wgpu::Buffer, wgpu::BindGroup)>,
+    occurrence_tile_pipeline: wgpu::ComputePipeline,
+    occurrence_cluster_pipeline: wgpu::ComputePipeline,
+    occurrence_finalize_pipeline: wgpu::ComputePipeline,
+    chain_views_scratch: Vec<crate::GpuChainView>,
+    /// Live chains this frame (0: no occurrence cull).
+    chain_count: u32,
     /// The gather's constants (the frame's origin, the source's rows), its pipeline and
     /// its bind group (rebuilt when SceneDB reallocates the column).
     gather_uniforms: wgpu::Buffer,
@@ -145,8 +186,6 @@ pub struct FoliagePlacePass {
     /// present (`GroundGeometry::present`); the built-in one meanwhile.
     offered: Option<Arc<GroundLink>>,
     built_in: Arc<GroundLink>,
-    /// The chart the resident tiles lie on.
-    chart: Option<u64>,
     /// The renderer's world origin the frames were written for.
     world_origin: Option<DVec3>,
     /// Batches of queries published so far (the last one is `batch`).
@@ -192,9 +231,12 @@ pub struct FoliagePlacePass {
     placeholder_terrain: wgpu::TextureView,
     terrain_sampler: wgpu::Sampler,
 
-    /// The bands, and each one's ring (slots local to the band).
+    /// The band table, and the eye sets that each hold one set of its rings.
     bands: GpuFoliageBands,
-    rings: Vec<TileRing>,
+    sets: Vec<EyeSet>,
+    /// Slots and arena records one eye set holds.
+    slots_per_set: u32,
+    records_per_set: u32,
     range: FoliageRange,
     quality: FoliageQuality,
     total_slots: u32,
@@ -260,6 +302,19 @@ impl FoliagePlacePass {
         stats: &helio_core::FrameStats,
         range: FoliageRange,
     ) -> Self {
+        Self::new_with_portal_eyes(device, quality, stats, range, 0)
+    }
+
+    /// [`Self::new_with`], keeping foliage resident around `portal_eyes` places portals
+    /// show besides the camera ([`crate::FoliageSettings::portal_eyes`]): each an eye
+    /// set of its own slots and slabs, the arena's memory again.
+    pub fn new_with_portal_eyes(
+        device: &wgpu::Device,
+        quality: FoliageQuality,
+        stats: &helio_core::FrameStats,
+        range: FoliageRange,
+        portal_eyes: u32,
+    ) -> Self {
         let cluster_size = quality.cluster_granularity().max(1);
         let range = FoliageRange {
             range: if range.range.is_finite() && range.range > 0.0 {
@@ -276,15 +331,19 @@ impl FoliagePlacePass {
             ..range
         };
         let bands = plan_bands(&range);
-        let total_slots = bands.slots().max(1);
-        let records = bands.records().max(1);
+        let eye_sets = 1 + portal_eyes.min(4);
+        let slots_per_set = bands.slots().max(1);
+        let records_per_set = bands.records().max(1) as u32;
+        let total_slots = slots_per_set * eye_sets;
+        let records = u64::from(records_per_set) * u64::from(eye_sets);
         let max_slab = bands.bands().iter().map(|b| b.slab).max().unwrap_or(1);
         let clusters_per_tile = max_slab.div_ceil(cluster_size).max(1);
         log::info!(
-            "foliage: {} bands to {:.0} m, {} slots, arena {:.1} MiB ({})",
+            "foliage: {} bands to {:.0} m, {} eye sets of {} slots, arena {:.1} MiB ({})",
             bands.count,
             bands.range,
-            total_slots,
+            eye_sets,
+            slots_per_set,
             (records * BLADE_BYTES) as f64 / (1024.0 * 1024.0),
             bands
                 .bands()
@@ -352,6 +411,31 @@ impl FoliagePlacePass {
             16 + u64::from(FOLIAGE_MAX_INTERACTORS) * INTERACTOR_BYTES,
             wgpu::BufferUsages::COPY_DST,
         );
+        let max_chains = u64::from(helio_portal_api::MAX_CHAINS);
+        let chain_views = storage(
+            "Foliage Chain Views",
+            max_chains * std::mem::size_of::<crate::GpuChainView>() as u64,
+            wgpu::BufferUsages::COPY_DST,
+        );
+        let occurrence_region_bytes = FOLIAGE_LOD_VERTEX_COUNTS.len() as u64
+            * u64::from(crate::FOLIAGE_OCCURRENCES_PER_LOD)
+            * 4;
+        let occurrence_blades = storage(
+            "Foliage Occurrence Blades",
+            occurrence_region_bytes,
+            wgpu::BufferUsages::empty(),
+        );
+        let occurrence_chains = storage(
+            "Foliage Occurrence Chains",
+            occurrence_region_bytes,
+            wgpu::BufferUsages::empty(),
+        );
+        let occurrence_indirect = storage(
+            "Foliage Occurrence Draws",
+            FOLIAGE_LOD_VERTEX_COUNTS.len() as u64
+                * std::mem::size_of::<wgpu::util::DrawIndirectArgs>() as u64,
+            wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+        );
 
         let plain = |label: &str, size: u64, usage: wgpu::BufferUsages| {
             device.create_buffer(&wgpu::BufferDescriptor {
@@ -399,7 +483,22 @@ impl FoliagePlacePass {
         );
         let tile_visibility = plain(
             "Foliage Tile Visibility",
-            total_slots as u64 * 4,
+            u64::from(slots_per_set) * 4,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        let occurrence_counters = plain(
+            "Foliage Occurrence Counters",
+            (FOLIAGE_LOD_VERTEX_COUNTS.len() as u64 + 1) * 4,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        let occurrence_tiles = plain(
+            "Foliage Occurrence Tile Visibility",
+            max_chains * u64::from(slots_per_set) * 4,
+            wgpu::BufferUsages::STORAGE,
+        );
+        let set_eyes = plain(
+            "Foliage Eye Set Eyes",
+            u64::from(eye_sets) * 16,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         );
         let place_uniforms = plain(
@@ -470,7 +569,11 @@ impl FoliagePlacePass {
             device,
             "Foliage Cull Shader",
             helio_core::include_wgsl!("../shaders/foliage_cull.wgsl"),
-            &snippets,
+            &[
+                crate::COMMON_SNIPPET,
+                crate::GROUND_SNIPPET,
+                helio_portal_api::PORTAL_CHAIN_SNIPPET,
+            ],
         );
         let gather_shader = helio_core::shader::module_with(
             device,
@@ -516,6 +619,9 @@ impl FoliagePlacePass {
                 uniform_entry(13),
                 storage_entry(14, true),
                 storage_entry(15, false),
+                // Each eye set's eye (frame space): where its tiles' ground queries
+                // start.
+                storage_entry(16, true),
             ],
         });
         let cull_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -559,12 +665,32 @@ impl FoliagePlacePass {
         let gather_layout = layout("Foliage Interactors PL", &gather_bgl);
         let place_layout = layout("Foliage Place PL", &place_bgl);
         let cull_layout = layout("Foliage Cull PL", &cull_bgl);
+        // The occurrence cull: the frame's cull bindings, then the chains'
+        // (`helio_portal_api`) and the occurrences it writes.
+        let occurrence_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Foliage Occurrence Cull BGL"),
+            entries: &[
+                storage_entry(0, true),
+                storage_entry(1, true),
+                storage_entry(2, true),
+                storage_entry(3, false),
+                storage_entry(4, false),
+                storage_entry(5, false),
+                storage_entry(6, false),
+                storage_entry(7, false),
+            ],
+        });
+        let occurrence_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Foliage Occurrence Cull PL"),
+            bind_group_layouts: &[Some(&cull_bgl), Some(&occurrence_bgl)],
+            immediate_size: 0,
+        });
         let pipeline = |label: &str,
                         layout: &wgpu::PipelineLayout,
                         module: &wgpu::ShaderModule,
                         entry: &str| {
             helio_core::shader::create_compute_pipeline(
-                &device,
+                device,
                 wgpu::ComputePipelineDescriptor {
                     label: Some(label),
                     layout: Some(layout),
@@ -624,12 +750,12 @@ impl FoliagePlacePass {
                 ("STAT_BLADES", helio_foliage_api::stats::BLADES_DRAWN),
             ])
         };
-        let cull_pipeline = |label: &str, entry: &str| {
+        let cull_pipeline_with = |label: &str, layout: &wgpu::PipelineLayout, entry: &str| {
             helio_core::shader::create_compute_pipeline(
-                &device,
+                device,
                 wgpu::ComputePipelineDescriptor {
                     label: Some(label),
-                    layout: Some(&cull_layout),
+                    layout: Some(layout),
                     module: &cull_shader,
                     entry_point: Some(entry),
                     compilation_options: wgpu::PipelineCompilationOptions {
@@ -640,6 +766,20 @@ impl FoliagePlacePass {
                 },
             )
         };
+        let cull_pipeline =
+            |label: &str, entry: &str| cull_pipeline_with(label, &cull_layout, entry);
+        let occurrence_pipeline =
+            |label: &str, entry: &str| cull_pipeline_with(label, &occurrence_layout, entry);
+        let occurrence_tile_pipeline = occurrence_pipeline(
+            "Foliage Occurrence Tile Cull Pipeline",
+            "cs_tile_cull_chains",
+        );
+        let occurrence_cluster_pipeline = occurrence_pipeline(
+            "Foliage Occurrence Cluster Cull Pipeline",
+            "cs_cluster_cull_chains",
+        );
+        let occurrence_finalize_pipeline =
+            occurrence_pipeline("Foliage Occurrence Finalize Pipeline", "cs_finalize_chains");
         let tile_cull_pipeline = cull_pipeline("Foliage Tile Cull Pipeline", "cs_tile_cull");
         let cluster_cull_pipeline =
             cull_pipeline("Foliage Cluster Cull Pipeline", "cs_cluster_cull");
@@ -651,16 +791,23 @@ impl FoliagePlacePass {
             "cs_gather",
         );
 
-        let rings = bands
-            .bands()
-            .iter()
-            .map(|b| {
-                TileRing::new(
-                    b.slot_count,
-                    FOLIAGE_BAND_TILES,
-                    b.tile_size,
-                    BAND_TILES_PER_FRAME,
-                )
+        let sets = (0..eye_sets)
+            .map(|_| EyeSet {
+                rings: bands
+                    .bands()
+                    .iter()
+                    .map(|b| {
+                        TileRing::new(
+                            b.slot_count,
+                            FOLIAGE_BAND_TILES,
+                            b.tile_size,
+                            BAND_TILES_PER_FRAME,
+                        )
+                    })
+                    .collect(),
+                chart: None,
+                eye: None,
+                key: None,
             })
             .collect();
 
@@ -673,6 +820,20 @@ impl FoliagePlacePass {
             tile_frames,
             bands_buffer,
             interactors,
+            chain_views,
+            occurrence_blades,
+            occurrence_chains,
+            occurrence_indirect,
+            occurrence_counters,
+            occurrence_tiles,
+            set_eyes,
+            occurrence_bgl,
+            occurrence_bind_group: None,
+            occurrence_tile_pipeline,
+            occurrence_cluster_pipeline,
+            occurrence_finalize_pipeline,
+            chain_views_scratch: Vec::new(),
+            chain_count: 0,
             gather_uniforms,
             gather_rows: 0,
             gather_pipeline,
@@ -685,7 +846,6 @@ impl FoliagePlacePass {
             ground: built_in.clone(),
             offered: None,
             built_in,
-            chart: None,
             world_origin: None,
             batch: 0,
             asked: Vec::new(),
@@ -720,7 +880,9 @@ impl FoliagePlacePass {
             placeholder_terrain,
             terrain_sampler,
             bands,
-            rings,
+            sets,
+            slots_per_set,
+            records_per_set,
             range,
             quality,
             total_slots,
@@ -733,7 +895,7 @@ impl FoliagePlacePass {
             query_count: 0,
             cluster_dispatch_width: 1,
             cluster_dispatch_height: 1,
-            tile_dispatch_groups: total_slots.div_ceil(WORKGROUP_SIZE).max(1),
+            tile_dispatch_groups: slots_per_set.div_ceil(WORKGROUP_SIZE).max(1),
             warned_type_overflow: false,
             type_liveness: crate::foliage_type_liveness(),
             commands_recorded: 0,
@@ -762,7 +924,9 @@ impl FoliagePlacePass {
     /// placed again.
     fn grow_on(&mut self, ground: Arc<GroundLink>) {
         self.ground = ground;
-        self.chart = None;
+        for set in &mut self.sets {
+            set.chart = None;
+        }
         self.asked.clear();
     }
 
@@ -800,7 +964,7 @@ impl FoliagePlacePass {
         &self.bands
     }
 
-    /// Slots over every band, i.e. entries in [`FoliagePlacePass::tile_table`].
+    /// Slots over every band and eye set, i.e. entries in [`FoliagePlacePass::tile_table`].
     #[inline]
     pub fn slot_count(&self) -> u32 {
         self.total_slots
@@ -844,10 +1008,16 @@ impl FoliagePlacePass {
         self.place_tile_count
     }
 
-    /// The bands' rings, for tests and debug overlays (slots local to each band).
+    /// The camera's bands' rings, for tests and debug overlays (slots local to each band).
     #[inline]
     pub fn rings(&self) -> &[TileRing] {
-        &self.rings
+        &self.sets[0].rings
+    }
+
+    /// The places foliage keeps resident around: the camera's, then those portals show.
+    #[inline]
+    pub fn eye_set_count(&self) -> usize {
+        self.sets.len()
     }
 
     /// Advance the non-blocking readback. Called once per frame from `prepare`.
@@ -895,6 +1065,63 @@ impl FoliagePlacePass {
         });
     }
 
+    /// Point the eye sets at this frame's eyes: the first at the camera (`eye`), the others
+    /// at the places the live chains show, and give each chain the set it draws
+    /// ([`crate::GpuChainView`], in [`Self::chain_views_scratch`]).
+    ///
+    /// Chains come shallowest first. A chain whose content eye is within the near band's
+    /// reach of the camera draws the camera's set; else the set already following its
+    /// route, one whose eye is that close to it, or a free one, which then follows the
+    /// route while it lives. With every set taken a chain draws the nearest set's tiles
+    /// (what lies around its eye may not be resident): the setting's budget, not a fault.
+    fn assign_eyes(&mut self, eye: DVec3, origin: DVec3, chains: &[helio_portal_api::LiveChain]) {
+        self.sets[0].eye = Some(eye);
+        let reach = f64::from(self.bands.bands[0].outer.max(1.0));
+        // A route gone frees its set (its tiles stay resident until another route takes it).
+        for set in &mut self.sets[1..] {
+            if set
+                .key
+                .is_some_and(|key| !chains.iter().any(|chain| chain.key == key))
+            {
+                set.key = None;
+            }
+        }
+        let count = chains.len().min(helio_portal_api::MAX_CHAINS as usize);
+        self.chain_views_scratch.clear();
+        for chain in &chains[..count] {
+            let at = origin + chain.content_eye.as_dvec3();
+            let near = |set: &EyeSet| set.eye.is_some_and(|e| e.distance(at) <= reach);
+            let set = if near(&self.sets[0]) {
+                Some(0)
+            } else if let Some(set) =
+                (1..self.sets.len()).find(|&set| self.sets[set].key == Some(chain.key))
+            {
+                self.sets[set].eye = Some(at);
+                Some(set)
+            } else if let Some(set) = (1..self.sets.len()).find(|&set| near(&self.sets[set])) {
+                Some(set)
+            } else if let Some(set) = (1..self.sets.len()).find(|&set| self.sets[set].key.is_none())
+            {
+                self.sets[set].key = Some(chain.key);
+                self.sets[set].eye = Some(at);
+                Some(set)
+            } else {
+                (0..self.sets.len())
+                    .filter(|&set| self.sets[set].eye.is_some())
+                    .min_by(|&a, &b| {
+                        let d =
+                            |set: usize| self.sets[set].eye.map_or(f64::MAX, |e| e.distance(at));
+                        d(a).total_cmp(&d(b))
+                    })
+            };
+            self.chain_views_scratch.push(crate::GpuChainView {
+                eye: chain.content_eye.to_array(),
+                eye_set: set.map_or(crate::NO_EYE_SET, |set| set as u32),
+            });
+        }
+        self.chain_count = self.chain_views_scratch.len() as u32;
+    }
+
     /// The frame of band `band`'s tile `coord` (band tiles) on `chart`.
     fn band_frame(&self, chart: u64, band: usize, coord: [i32; 2]) -> Option<crate::TileFrame> {
         let span = self.bands.bands[band].tile_span;
@@ -908,20 +1135,27 @@ impl FoliagePlacePass {
     fn upload_tile_headers(
         &mut self,
         ctx: &PrepareContext,
+        set: usize,
         generation: u32,
         chart: u64,
         world_origin: DVec3,
         all_frames: bool,
     ) {
-        for band in 0..self.rings.len() {
+        let set_slots = set as u32 * self.slots_per_set;
+        let set_records = set as u32 * self.records_per_set;
+        for band in 0..self.sets[set].rings.len() {
             let b = self.bands.bands[band];
+            let slot_base = set_slots + b.slot_base;
             let mut dirty: Vec<u32> = if all_frames {
                 (0..b.slot_count).collect()
             } else {
-                self.rings[band].dirty_slots().to_vec()
+                self.sets[set].rings[band].dirty_slots().to_vec()
             };
-            let headers: std::collections::HashSet<u32> =
-                self.rings[band].dirty_slots().iter().copied().collect();
+            let headers: std::collections::HashSet<u32> = self.sets[set].rings[band]
+                .dirty_slots()
+                .iter()
+                .copied()
+                .collect();
             dirty.sort_unstable();
             dirty.dedup();
             let mut index = 0usize;
@@ -934,7 +1168,7 @@ impl FoliagePlacePass {
                 let last = dirty[end];
                 self.frame_scratch.clear();
                 for local in start..=last {
-                    let frame = self.rings[band]
+                    let frame = self.sets[set].rings[band]
                         .slot_coord(local)
                         .and_then(|coord| self.band_frame(chart, band, coord));
                     self.frame_scratch
@@ -942,7 +1176,7 @@ impl FoliagePlacePass {
                 }
                 ctx.write_buffer(
                     &self.tile_frames,
-                    u64::from(b.slot_base + start) * FRAME_BYTES,
+                    u64::from(slot_base + start) * FRAME_BYTES,
                     bytemuck::cast_slice(&self.frame_scratch),
                 );
                 // The headers of the slots the ring changed (a frame rewritten for a moved
@@ -950,7 +1184,7 @@ impl FoliagePlacePass {
                 self.header_scratch.clear();
                 let flush = |scratch: &mut Vec<GpuFoliageTile>, next: u32| {
                     if !scratch.is_empty() {
-                        let first = b.slot_base + next - scratch.len() as u32;
+                        let first = slot_base + next - scratch.len() as u32;
                         ctx.write_buffer(
                             &self.tile_table,
                             u64::from(first) * TILE_BYTES,
@@ -965,10 +1199,10 @@ impl FoliagePlacePass {
                         flush(&mut scratch, local);
                         continue;
                     }
-                    scratch.push(match self.rings[band].slot_coord(local) {
+                    scratch.push(match self.sets[set].rings[band].slot_coord(local) {
                         Some(coord) => GpuFoliageTile {
                             tile_coord: coord,
-                            blade_offset: b.arena_base + local * b.slab,
+                            blade_offset: set_records + b.arena_base + local * b.slab,
                             blade_count: 0,
                             bounds_center: 0.0,
                             bounds_half: 0.0,
@@ -997,12 +1231,14 @@ impl FoliagePlacePass {
             .limits()
             .max_compute_workgroups_per_dimension
             .max(1);
-        let cluster_groups = (self.total_slots as u64 * self.clusters_per_tile as u64)
+        // The camera's eye set (the first): the frame's own cull. The others are
+        // what portal chains show, culled per chain (`cs_*_chains`).
+        let cluster_groups = (self.slots_per_set as u64 * self.clusters_per_tile as u64)
             .div_ceil(WORKGROUP_SIZE as u64)
             .max(1) as u32;
         self.cluster_dispatch_width = cluster_groups.min(max_dispatch).max(1);
         self.cluster_dispatch_height = cluster_groups.div_ceil(self.cluster_dispatch_width);
-        self.tile_dispatch_groups = self.total_slots.div_ceil(WORKGROUP_SIZE).max(1);
+        self.tile_dispatch_groups = self.slots_per_set.div_ceil(WORKGROUP_SIZE).max(1);
 
         let max_dim = ctx.width.max(ctx.height).max(1);
         let hiz_mip_count = (u32::BITS - max_dim.leading_zeros()).max(1);
@@ -1015,7 +1251,7 @@ impl FoliagePlacePass {
             &self.cull_uniforms,
             0,
             bytemuck::bytes_of(&FoliageCullUniforms {
-                tile_count: self.total_slots,
+                tile_count: self.slots_per_set,
                 screen_width: ctx.width,
                 screen_height: ctx.height,
                 hiz_mip_count,
@@ -1030,7 +1266,7 @@ impl FoliagePlacePass {
                 max_foliage_height: MAX_FOLIAGE_HEIGHT,
                 wpo_extent: DEFAULT_WPO_EXTENT_METERS,
                 lod_fade_band: FOLIAGE_LOD_FADE_BAND_METERS,
-                _pad: [0; 1],
+                chain_count: self.chain_count,
             }),
         );
 
@@ -1045,8 +1281,9 @@ impl FoliagePlacePass {
                 } else {
                     "built in"
                 },
-                self.chart,
-                self.rings
+                self.sets[0].chart,
+                self.sets[0]
+                    .rings
                     .iter()
                     .map(TileRing::resident_count)
                     .collect::<Vec<_>>(),
@@ -1084,6 +1321,12 @@ impl RenderPass for FoliagePlacePass {
 
     fn reads(&self) -> &'static [&'static str] {
         &[helio_frame_api::depth::HIZ]
+    }
+
+    /// What portals show, when the portals draw: the chains pass's rows.
+    fn declare_resources(&self, builder: &mut helio_core::graph::ResourceBuilder) {
+        builder.read_optional(helio_portal_api::PORTAL_CHAINS);
+        builder.read_optional(helio_portal_api::PORTAL_STAGES);
     }
 
     fn writes(&self) -> &'static [&'static str] {
@@ -1164,21 +1407,36 @@ impl RenderPass for FoliagePlacePass {
         let camera = glam::Vec3::new(position_near[0], position_near[1], position_near[2]);
         let eye = world_origin + camera.as_dvec3();
         self.follow_present_ground();
-        let Some(chart) = self.ground.geometry().chart(eye) else {
-            // The ground cannot tile yet (not loaded): draw what is resident.
-            self.place_tile_count = 0;
-            self.queued_tile_count = 0;
-            self.query_count = 0;
-            return self.prepare_cull(ctx, type_count);
-        };
-        let chart_changed = self.chart != Some(chart.id);
-        self.chart = Some(chart.id);
         let origin_moved = self.world_origin != Some(world_origin);
         self.world_origin = Some(world_origin);
 
+        // Where each eye set's rings follow: the camera's, and the places the portals'
+        // live chains show; each chain draws the set it was given.
+        let live_chains = ctx
+            .registry
+            .get(helio_portal_api::PORTAL_LIVE_CHAINS)
+            .unwrap_or(&[]);
+        self.assign_eyes(eye, world_origin, live_chains);
+        if !self.chain_views_scratch.is_empty() {
+            ctx.write_buffer(
+                &self.chain_views,
+                0,
+                bytemuck::cast_slice(&self.chain_views_scratch),
+            );
+        }
+        let set_eyes: Vec<[f32; 4]> = self
+            .sets
+            .iter()
+            .map(|set| {
+                let at = (set.eye.unwrap_or(eye) - world_origin).as_vec3();
+                [at.x, at.y, at.z, 0.0]
+            })
+            .collect();
+        ctx.write_buffer(&self.set_eyes, 0, bytemuck::cast_slice(&set_eyes));
+
         // Residency is keyed on (tile_coord, generation): a tile is re-placed whenever the
-        // type or layer table's contents, or the chart, change. The records' seed follows
-        // the type table alone.
+        // type or layer table's contents, or its set's chart, change. The records' seed
+        // follows the type table alone.
         let mix = |handle: &helio_core::BufferHandle| {
             handle.epoch
                 ^ handle
@@ -1189,115 +1447,143 @@ impl RenderPass for FoliagePlacePass {
         let layers = ctx
             .scene_buffers
             .get(helio_foliage_api::FOLIAGE_LAYERS.key());
-        let generation = (mix(type_handle)
-            ^ layers.map_or(0, |h| mix(h).rotate_left(29))
-            ^ chart.id.wrapping_mul(0xc2b2_ae3d_27d4_eb4f).rotate_left(13))
-            as u32;
-        if chart_changed {
-            self.asked.clear();
-        }
-        let ring_eye = [chart.eye[0] as f32, chart.eye[1] as f32];
-        let mut invalidated = false;
-        for ring in &mut self.rings {
-            let update = ring.update(ring_eye, generation);
-            invalidated |= update.invalidated;
-            if update.evicted > 0 {
-                log::debug!(
-                    "foliage ring evicted {} resident tiles to make room",
-                    update.evicted
-                );
-            }
-        }
+        let tables = mix(type_handle) ^ layers.map_or(0, |h| mix(h).rotate_left(29));
 
-        // Last frame's tiles, placed from their answers where they came: the ground
-        // answered the batch (the built-in plane always does), the origin the queries
-        // were written in still holds, and the slot still holds the tile. The others are
-        // asked again.
+        // Last frame's tiles are placed from their answers where they came: the ground
+        // answered the batch (the built-in plane always does), the origin the queries were
+        // written in still holds, and the slot still holds the tile. The others are asked
+        // again.
         let answered = !self.ground.is_external() || self.ground.answered() == Some(self.batch);
-        let asked = std::mem::take(&mut self.asked);
+        let changes: Vec<_> = self.ground.take_changes().into_iter().collect();
+        let mut asked = std::mem::take(&mut self.asked);
         self.queue_scratch.clear();
-        for a in &asked {
-            let base = self.bands.bands[a.band].slot_base;
-            let held = self.rings[a.band].slot_coord(a.slot - base) == Some(a.coord);
-            if held && answered && !origin_moved && !invalidated {
-                self.queue_scratch.push([a.slot, a.first]);
-            } else if held {
-                self.rings[a.band].refresh(a.coord);
+        let mut charts: Vec<Option<u64>> = vec![None; self.sets.len()];
+        for (set, set_chart) in charts.iter_mut().enumerate() {
+            // The ground's chart around the set's eye. Tiles of one chart only are
+            // resident in a set: a new chart (another cube face under the eye, another
+            // ground) places every tile again. Without one (the ground not loaded there
+            // yet) the set draws what it holds.
+            let chart = self.sets[set]
+                .eye
+                .and_then(|at| self.ground.geometry().chart(at));
+            let Some(chart) = chart else {
+                asked.retain(|a| a.set != set);
+                continue;
+            };
+            *set_chart = Some(chart.id);
+            let chart_changed = self.sets[set].chart != Some(chart.id);
+            self.sets[set].chart = Some(chart.id);
+            if chart_changed {
+                asked.retain(|a| a.set != set);
             }
-        }
-        self.place_tile_count = self.queue_scratch.len() as u32;
+            let generation =
+                (tables ^ chart.id.wrapping_mul(0xc2b2_ae3d_27d4_eb4f).rotate_left(13)) as u32;
+            let ring_eye = [chart.eye[0] as f32, chart.eye[1] as f32];
+            let mut invalidated = false;
+            for ring in &mut self.sets[set].rings {
+                let update = ring.update(ring_eye, generation);
+                invalidated |= update.invalidated;
+                if update.evicted > 0 {
+                    log::debug!(
+                        "foliage ring evicted {} resident tiles to make room",
+                        update.evicted
+                    );
+                }
+            }
+            let set_slots = set as u32 * self.slots_per_set;
+            for a in asked.iter().filter(|a| a.set == set) {
+                let base = set_slots + self.bands.bands[a.band].slot_base;
+                let held = self.sets[set].rings[a.band].slot_coord(a.slot - base) == Some(a.coord);
+                if held && answered && !origin_moved && !invalidated {
+                    self.queue_scratch.push([a.slot, a.first]);
+                } else if held {
+                    self.sets[set].rings[a.band].refresh(a.coord);
+                }
+            }
 
-        // The ground's changes since last frame: the resident tiles under them are placed
-        // again (their records draw meanwhile).
-        for [lo, hi] in self.ground.take_changes() {
-            let mut range: Option<([f64; 2], [f64; 2])> = None;
-            for corner in 0..8 {
-                let p = DVec3::new(
-                    if corner & 1 == 0 { lo.x } else { hi.x },
-                    if corner & 2 == 0 { lo.y } else { hi.y },
-                    if corner & 4 == 0 { lo.z } else { hi.z },
-                );
-                let Some(at) = self.ground.geometry().locate(chart.id, p) else {
-                    continue;
-                };
-                range = Some(match range {
-                    None => (at, at),
-                    Some((a, b)) => (
-                        [a[0].min(at[0]), a[1].min(at[1])],
-                        [b[0].max(at[0]), b[1].max(at[1])],
-                    ),
-                });
-            }
-            if let Some((a, b)) = range {
-                for (band, ring) in self.rings.iter_mut().enumerate() {
-                    let size = f64::from(self.bands.bands[band].tile_size);
-                    let tile = |v: f64| (v / size).floor() as i32;
-                    for coord in
-                        ring.resident_within([tile(a[0]), tile(a[1])], [tile(b[0]), tile(b[1])])
-                    {
-                        ring.refresh(coord);
+            // The ground's changes since last frame: the resident tiles under them are
+            // placed again (their records draw meanwhile).
+            for &[lo, hi] in &changes {
+                let mut range: Option<([f64; 2], [f64; 2])> = None;
+                for corner in 0..8 {
+                    let p = DVec3::new(
+                        if corner & 1 == 0 { lo.x } else { hi.x },
+                        if corner & 2 == 0 { lo.y } else { hi.y },
+                        if corner & 4 == 0 { lo.z } else { hi.z },
+                    );
+                    let Some(at) = self.ground.geometry().locate(chart.id, p) else {
+                        continue;
+                    };
+                    range = Some(match range {
+                        None => (at, at),
+                        Some((a, b)) => (
+                            [a[0].min(at[0]), a[1].min(at[1])],
+                            [b[0].max(at[0]), b[1].max(at[1])],
+                        ),
+                    });
+                }
+                if let Some((a, b)) = range {
+                    for (band, ring) in self.sets[set].rings.iter_mut().enumerate() {
+                        let size = f64::from(self.bands.bands[band].tile_size);
+                        let tile = |v: f64| (v / size).floor() as i32;
+                        for coord in
+                            ring.resident_within([tile(a[0]), tile(a[1])], [tile(b[0]), tile(b[1])])
+                        {
+                            ring.refresh(coord);
+                        }
                     }
                 }
             }
-        }
 
-        // This frame's questions: each band's entering tiles (budgeted by its ring), then
-        // those placed again, nearest band first, while the queries fit.
-        self.upload_tile_headers(
-            ctx,
-            seed_generation,
-            chart.id,
-            world_origin,
-            origin_moved || chart_changed,
-        );
+            self.upload_tile_headers(
+                ctx,
+                set,
+                seed_generation,
+                chart.id,
+                world_origin,
+                origin_moved || chart_changed,
+            );
+        }
+        self.place_tile_count = self.queue_scratch.len() as u32;
+
+        // This frame's questions: each set's bands' entering tiles (budgeted by their
+        // rings), then those placed again, the camera's set and nearest band first, while
+        // the queries fit.
         self.query_count = 0;
         let mut queued = Vec::new();
-        for band in 0..self.rings.len() {
-            let b = self.bands.bands[band];
-            let cells = b.candidate_grid * b.candidate_grid;
-            let locals: Vec<u32> = self.rings[band]
-                .place_queue()
-                .iter()
-                .chain(self.rings[band].refresh_queue())
-                .copied()
-                .collect();
-            for local in locals {
-                let Some(coord) = self.rings[band].slot_coord(local) else {
-                    continue;
-                };
-                let fits = self.query_count + cells <= QUERY_CAPACITY
-                    && (self.place_tile_count + queued.len() as u32) < 2 * MAX_QUEUED_TILES
-                    && (queued.len() as u32) < MAX_QUEUED_TILES;
-                if fits {
-                    queued.push(Asked {
-                        band,
-                        slot: b.slot_base + local,
-                        coord,
-                        first: self.query_count,
-                    });
-                    self.query_count += cells;
-                } else {
-                    self.rings[band].refresh(coord);
+        for (set, chart) in charts.iter().enumerate() {
+            if chart.is_none() {
+                continue;
+            }
+            let set_slots = set as u32 * self.slots_per_set;
+            for band in 0..self.sets[set].rings.len() {
+                let b = self.bands.bands[band];
+                let cells = b.candidate_grid * b.candidate_grid;
+                let locals: Vec<u32> = self.sets[set].rings[band]
+                    .place_queue()
+                    .iter()
+                    .chain(self.sets[set].rings[band].refresh_queue())
+                    .copied()
+                    .collect();
+                for local in locals {
+                    let Some(coord) = self.sets[set].rings[band].slot_coord(local) else {
+                        continue;
+                    };
+                    let fits = self.query_count + cells <= QUERY_CAPACITY
+                        && (self.place_tile_count + queued.len() as u32) < 2 * MAX_QUEUED_TILES
+                        && (queued.len() as u32) < MAX_QUEUED_TILES;
+                    if fits {
+                        queued.push(Asked {
+                            set,
+                            band,
+                            slot: set_slots + b.slot_base + local,
+                            coord,
+                            first: self.query_count,
+                        });
+                        self.query_count += cells;
+                    } else {
+                        self.sets[set].rings[band].refresh(coord);
+                    }
                 }
             }
         }
@@ -1311,12 +1597,16 @@ impl RenderPass for FoliagePlacePass {
                 let mut tiles = Vec::new();
                 for a in &self.asked {
                     let b = self.bands.bands[a.band];
-                    let Some(frame) = self.band_frame(chart.id, a.band, a.coord) else {
+                    let Some(chart) = charts[a.set] else {
+                        continue;
+                    };
+                    let Some(frame) = self.band_frame(chart, a.band, a.coord) else {
                         continue;
                     };
                     let up = frame.up.normalize_or(DVec3::Y);
+                    let set_eye = self.sets[a.set].eye.unwrap_or(eye);
                     let start_height =
-                        (eye - frame.origin).dot(up) + f64::from(SEARCH_ABOVE_METRES);
+                        (set_eye - frame.origin).dot(up) + f64::from(SEARCH_ABOVE_METRES);
                     let blocks = b.probe_blocks.max(1);
                     let per_block = (b.candidate_grid / blocks).pow(2);
                     for block in 0..blocks * blocks {
@@ -1393,10 +1683,8 @@ impl RenderPass for FoliagePlacePass {
                 layer_count,
                 search_above: SEARCH_ABOVE_METRES,
                 search_below: SEARCH_BELOW_METRES,
-                eye: camera.to_array(),
                 place_part_count: self.place_part_count,
                 query_part_count: self.query_part_count,
-                _pad: 0,
             }),
         );
         self.prepare_cull(ctx, type_count)
@@ -1457,6 +1745,7 @@ impl RenderPass for FoliagePlacePass {
                         entry(13, self.bands_buffer.as_entire_binding()),
                         entry(14, self.place_parts.as_entire_binding()),
                         entry(15, self.place_scratch.as_entire_binding()),
+                        entry(16, self.set_eyes.as_entire_binding()),
                     ],
                 }));
             self.place_bind_group_key = Some(place_key);
@@ -1492,6 +1781,48 @@ impl RenderPass for FoliagePlacePass {
         }
         let Some(cull_bg) = self.cull_bind_group.as_ref() else {
             return Ok(());
+        };
+
+        // The portals' chain rows this frame, and the occurrence cull's bind group over
+        // them (while a chain draws).
+        let chains = ctx
+            .registry
+            .get::<&wgpu::Buffer>(helio_core::ResourceKey::new(
+                helio_portal_api::PORTAL_CHAINS,
+            ));
+        let stages = ctx
+            .registry
+            .get::<&wgpu::Buffer>(helio_core::ResourceKey::new(
+                helio_portal_api::PORTAL_STAGES,
+            ));
+        let occurrence_bg = match (self.chain_count > 0, chains, stages) {
+            (true, Some(chains), Some(stages)) => {
+                let stale = self
+                    .occurrence_bind_group
+                    .as_ref()
+                    .is_none_or(|(c, s, _)| c != chains || s != stages);
+                if stale {
+                    let group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("Foliage Occurrence Cull BG"),
+                        layout: &self.occurrence_bgl,
+                        entries: &[
+                            entry(0, chains.as_entire_binding()),
+                            entry(1, stages.as_entire_binding()),
+                            entry(2, self.chain_views.as_entire_binding()),
+                            entry(3, self.occurrence_blades.as_entire_binding()),
+                            entry(4, self.occurrence_chains.as_entire_binding()),
+                            entry(5, self.occurrence_counters.as_entire_binding()),
+                            entry(6, self.occurrence_indirect.as_entire_binding()),
+                            entry(7, self.occurrence_tiles.as_entire_binding()),
+                        ],
+                    });
+                    self.occurrence_bind_group = Some((chains.clone(), stages.clone(), group));
+                }
+                self.occurrence_bind_group
+                    .as_ref()
+                    .map(|(_, _, group)| group.clone())
+            }
+            _ => None,
         };
 
         // `ctx.graphics_cmds()`, not `ctx.compute_cmds()`: the two streams are submitted
@@ -1597,6 +1928,45 @@ impl RenderPass for FoliagePlacePass {
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, cull_bg, &[]);
             pass.dispatch_workgroups(groups[0], groups[1], 1);
+        }
+
+        // What the portal chains show: each chain's tiles and clusters of the eye set it
+        // draws, culled from its content's eye through its map, into the occurrences.
+        encoder.clear_buffer(&self.occurrence_counters, 0, None);
+        if let Some(occurrence_bg) = occurrence_bg.as_ref() {
+            for (label, pipeline, groups) in [
+                (
+                    "Foliage Occurrence Tile Cull",
+                    &self.occurrence_tile_pipeline,
+                    [self.tile_dispatch_groups, self.chain_count, 1],
+                ),
+                (
+                    "Foliage Occurrence Cluster Cull",
+                    &self.occurrence_cluster_pipeline,
+                    [
+                        self.cluster_dispatch_width,
+                        self.cluster_dispatch_height,
+                        self.chain_count,
+                    ],
+                ),
+                (
+                    "Foliage Occurrence Finalize",
+                    &self.occurrence_finalize_pipeline,
+                    [1, 1, 1],
+                ),
+            ] {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some(label),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, cull_bg, &[]);
+                pass.set_bind_group(1, occurrence_bg, &[]);
+                pass.dispatch_workgroups(groups[0], groups[1], groups[2]);
+            }
+        } else {
+            // No chain draws: the occurrences' draws are empty.
+            encoder.clear_buffer(&self.occurrence_indirect, 0, None);
         }
 
         if matches!(self.readback_state, ReadbackState::Idle) {

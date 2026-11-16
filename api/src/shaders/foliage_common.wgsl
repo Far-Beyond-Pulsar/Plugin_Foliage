@@ -119,12 +119,36 @@ const FOLIAGE_BAND_LOD_BLADES: u32 = 0u;
 const FOLIAGE_BAND_LOD_TUFT_BLADES: u32 = 2u;
 const FOLIAGE_BAND_LOD_TUFT: u32 = 3u;
 
-/// The band tile-table slot `slot` belongs to.
+/// A live portal chain as foliage draws it (`GpuChainView`, a row per row of
+/// `helio_portal_api::PORTAL_CHAINS`): the camera in the chain's content (frame
+/// space) and the eye set whose tiles it draws (`FOLIAGE_NO_EYE_SET`: none).
+struct FoliageChainView {
+    eye: vec3<f32>,
+    eye_set: u32,
+}
+const FOLIAGE_NO_EYE_SET: u32 = 0xffffffffu;
+
+/// The slots one eye set holds: every band's, laid out from 0. The tile table
+/// holds one set per eye foliage keeps resident around (the camera, and the
+/// places portals show), one after another.
+fn foliage_slots_per_set() -> u32 {
+    let count = clamp(foliage_bands.count, 1u, 6u);
+    let last = foliage_bands.bands[count - 1u];
+    return max(last.slot_base + last.slot_count, 1u);
+}
+
+/// The eye set tile-table slot `slot` belongs to.
+fn foliage_set_of_slot(slot: u32) -> u32 {
+    return slot / foliage_slots_per_set();
+}
+
+/// The band tile-table slot `slot` belongs to (in its eye set).
 fn foliage_band_of_slot(slot: u32) -> u32 {
+    let local = slot % foliage_slots_per_set();
     let count = min(foliage_bands.count, 6u);
     for (var b = 0u; b < count; b++) {
         let band = foliage_bands.bands[b];
-        if slot < band.slot_base + band.slot_count {
+        if local < band.slot_base + band.slot_count {
             return b;
         }
     }

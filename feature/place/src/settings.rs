@@ -4,7 +4,7 @@
 //! engines build their settings UI from it and read the values back
 //! through it.
 
-use helio_settings::{choice, number, pick, toggle, Choice, Group, Resolved};
+use helio_settings::{choice, integer, number, pick, toggle, Choice, Group, Resolved};
 
 use crate::FoliageQuality;
 
@@ -24,6 +24,11 @@ pub struct FoliageSettings {
     /// Metres foliage reaches, or `None` for the quality preset's. Bands of
     /// tiles (`plan_bands`) carry it out there.
     pub range: Option<f32>,
+    /// Places besides the camera's foliage keeps resident for what portals
+    /// show (`helio_portal_api::PORTAL_LIVE_CHAINS`): each holds its own
+    /// tile rings, about the arena's memory again. 0: foliage shows only
+    /// where the camera's rings reach.
+    pub portal_eyes: u32,
 }
 
 impl Default for FoliageSettings {
@@ -34,6 +39,7 @@ impl Default for FoliageSettings {
             blades_per_tuft: None,
             quality: FoliageQuality::Medium,
             range: None,
+            portal_eyes: 1,
         }
     }
 }
@@ -92,6 +98,14 @@ pub static FOLIAGE: Group = Group {
             0.0,
             "Blades a tuft averages, sizing the near band; 0: 10",
         ),
+        integer(
+            "portal_eyes",
+            "Foliage Through Portals",
+            "Foliage",
+            (0, 4),
+            1,
+            "Places a portal shows that foliage keeps resident besides the camera's, the              nearest routes first; each costs about the foliage's memory again",
+        ),
     ],
 };
 
@@ -110,6 +124,7 @@ impl FoliageSettings {
             range: settings.optional("range").map(|m| m as f32),
             tufts_per_m2: settings.optional("tufts_per_m2").map(|n| n as f32),
             blades_per_tuft: settings.optional("blades_per_tuft").map(|n| n as f32),
+            portal_eyes: settings.number("portal_eyes").clamp(0.0, 4.0) as u32,
         }
     }
 
