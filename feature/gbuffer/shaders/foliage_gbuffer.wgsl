@@ -2,6 +2,7 @@
 //!use helio_prelude
 //!use helio_foliage_wind
 //!use helio_foliage_common
+//!use portal_chain
 
 // Foliage G-buffer rasterisation — tufts of blades, smooth or blocky, at four LODs.
 //
@@ -194,6 +195,22 @@ struct BoxState {
 @group(2) @binding(1) var<storage, read_write> box_state: BoxState;
 /// The cull's draws (`DrawIndirectArgs` per LOD): each LOD's visible records.
 @group(2) @binding(2) var<storage, read> lod_draws: array<vec4<u32>>;
+
+// ── What portal chains show (the occurrence draw, `*_occurrence`) ─────────────
+//
+// The same records, drawn through a chain (`helio_portal_api`): the occurrence lists are
+// bound where the frame's visible list is (binding 6), each record's chain alongside here.
+// A record is shaped in its content's world as seen from the camera's place there
+// (`FoliageChainView::eye`), mapped into the frame by the chain's matrix, and clipped to
+// what the chain shows per fragment.
+@group(3) @binding(0) var<storage, read> occurrence_chains: array<u32>;
+@group(3) @binding(1) var<storage, read> portal_chains: array<GpuPortalChain>;
+@group(3) @binding(2) var<storage, read> portal_stages: array<GpuPortalStage>;
+@group(3) @binding(3) var portal_mask: texture_2d<u32>;
+@group(3) @binding(4) var<storage, read> chain_views: array<FoliageChainView>;
+
+/// A shape's box is written with its chain in the tint word's upper half (`FoliageBox`).
+const FOLIAGE_BOX_NO_CHAIN: u32 = 0xffffu;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Small helpers
@@ -552,8 +569,11 @@ struct VertexOutput {
     /// (RGBA8; 0: none) with the height fraction it starts at (f32 bits).
     @location(10) @interpolate(flat) ground_colour: vec4<f32>,
     @location(11) @interpolate(flat) tip: vec2<u32>,
-    /// Where the fragment is in the view's space, for a clipped view's plane.
+    /// Where the fragment is in its content's world (the view's space where drawn
+    /// directly): a clipped view's plane, a chain's openings.
     @location(12) world_position: vec3<f32>,
+    /// The chain it is drawn through (the occurrence draw).
+    @location(13) @interpolate(flat) chain: u32,
 }
 
 // Whether the view the pipeline draws has a clip plane
@@ -586,7 +606,7 @@ struct Instance {
 /// share has dropped it, the type's reach has ended, or (the near band) the other LOD
 /// draws it: tufts switch from L0 to L1 a tuft at a time, by their own hash against the
 /// share of the switch band behind them (no dithered, see-through blades).
-fn foliage_instance(lod: u32, region_base: u32, index: u32) -> Instance {
+fn foliage_instance(lod: u32, region_base: u32, index: u32, eye: vec3<f32>) -> Instance {
     var out: Instance;
     let reference = visible_blades[region_base + index];
     out.slot = reference >> FOLIAGE_VISIBLE_TILE_SHIFT;
@@ -599,7 +619,7 @@ fn foliage_instance(lod: u32, region_base: u32, index: u32) -> Instance {
     out.blocky = (out.ty.kind_and_flags & 0xffu) == FOLIAGE_KIND_BLOCK;
     out.n = foliage_tuft_blades(out.record);
     let band = foliage_bands.bands[foliage_band_of_slot(out.slot)];
-    let d = distance(out.root, cameras[0].position_near.xyz);
+    let d = distance(out.root, eye);
     out.scale = foliage_tuft_scale(band, d, foliage_tuft_rank(out.record)) * foliage_type_reach(out.ty, d);
     out.drawn = out.scale > 0.0;
     if lod <= 1u {
@@ -611,14 +631,41 @@ fn foliage_instance(lod: u32, region_base: u32, index: u32) -> Instance {
     return out;
 }
 
+const FOLIAGE_IDENTITY: mat4x4<f32> = mat4x4<f32>(
+    vec4<f32>(1.0, 0.0, 0.0, 0.0), vec4<f32>(0.0, 1.0, 0.0, 0.0),
+    vec4<f32>(0.0, 0.0, 1.0, 0.0), vec4<f32>(0.0, 0.0, 0.0, 1.0));
+
 /// Smooth foliage, a strip a record: L0 and L1 a blade, L2 a tuft of cards, L3 a tuft as
 /// three broad blades. Blocky foliage is drawn as boxes (`cs_boxes`, `vs_box`).
 @vertex
 fn vs_main(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) instance_index: u32) -> VertexOutput {
+    var out = foliage_vertex(vertex_index, instance_index, cameras[0].position_near.xyz, FOLIAGE_IDENTITY, FOLIAGE_IDENTITY);
+    out.chain = 0u;
+    return out;
+}
+
+/// What a portal chain shows: occurrence `instance_index`'s record, shaped seen from the
+/// camera's place in its content and drawn through its chain.
+@vertex
+fn vs_occurrence(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) instance_index: u32) -> VertexOutput {
+    let chain_index = occurrence_chains[lod_info.region_base + instance_index];
+    let chain = portal_chains[chain_index];
+    var out = foliage_vertex(vertex_index, instance_index, chain_views[chain_index].eye, chain.content_to_drawn, chain.prev_content_to_drawn);
+    out.chain = chain_index;
+    if portal_chain_moved(chain) {
+        out.moved = max(out.moved, 1.0);
+    }
+    return out;
+}
+
+/// Record `instance_index` of this draw's LOD as seen from `eye`, in its content's world,
+/// drawn through `map` (identity directly; a chain's matrix through a portal, `prev_map`
+/// last frame's).
+fn foliage_vertex(vertex_index: u32, instance_index: u32, eye: vec3<f32>, map: mat4x4<f32>, prev_map: mat4x4<f32>) -> VertexOutput {
     // `instance_index` is relative to this draw (the producer writes `first_instance =
     // 0`); the LOD's region base comes from the per-LOD uniform.
     let lod = lod_info.lod;
-    let it = foliage_instance(lod, lod_info.region_base, instance_index);
+    let it = foliage_instance(lod, lod_info.region_base, instance_index, eye);
     if it.blocky || !it.drawn {
         return tail();
     }
@@ -719,10 +766,11 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) in
 
     var out: VertexOutput;
     out.world_position = world_base + foliage_to_world(basis, sway_now) + bend;
-    out.clip_position = cameras[0].view_proj * vec4<f32>(out.world_position, 1.0);
-    out.prev_clip_position = cameras[0].prev_view_proj * vec4<f32>(world_base + foliage_to_world(basis, sway_prev) + bend_prev, 1.0);
+    out.clip_position = cameras[0].view_proj * (map * vec4<f32>(out.world_position, 1.0));
+    out.prev_clip_position = cameras[0].prev_view_proj * (prev_map * vec4<f32>(world_base + foliage_to_world(basis, sway_prev) + bend_prev, 1.0));
     out.moved = length(foliage_to_world(basis, sway_now - sway_prev) + bend - bend_prev);
-    out.world_normal = foliage_to_world(basis, normal);
+    // The G-buffer holds normals in the space drawn into.
+    out.world_normal = mat3x3<f32>(map[0].xyz, map[1].xyz, map[2].xyz) * foliage_to_world(basis, normal);
     out.face_normal = out.world_normal;
     out.blocky = 0u;
     out.height_frac = clamp(height_frac, 0.0, 1.0);
@@ -758,7 +806,7 @@ fn foliage_box_room(count: u32) -> u32 {
 /// `tip_from`), at `at`: its centre in render space and its displacement by the wind (at
 /// the box's centre, whole, never under the ground) and the interactors, now and last
 /// frame.
-fn foliage_box_write(at: u32, it: Instance, bx: Box, total: f32, tip_from: f32, seed: u32, tint: vec2<f32>, lod: u32) {
+fn foliage_box_write(at: u32, it: Instance, bx: Box, total: f32, tip_from: f32, seed: u32, tint: vec2<f32>, lod: u32, chain: u32) {
     if at >= arrayLength(&boxes_out) {
         return;
     }
@@ -794,15 +842,17 @@ fn foliage_box_write(at: u32, it: Instance, bx: Box, total: f32, tip_from: f32, 
         moved,
         ground | (((it.record.packed_scale_type >> 16u) & 0xffu) << 16u) | ((lod & 3u) << 24u),
         moved_prev,
-        pack4x8unorm(vec4<f32>(tint, 0.0, 0.0)),
+        (pack4x8unorm(vec4<f32>(tint, 0.0, 0.0)) & 0xffffu) | (chain << 16u),
     );
 }
 
 /// The boxes of visible record `index` of LOD `lod`, if its type is blocky: L0 and L1 a
 /// blade's runs of cubes (at L1 with fewer jogs sideways), L2 a tuft's blades a box each
 /// from root to top, L3 a tuft as two crossed boxes as wide as its blades reach.
-fn foliage_expand(lod: u32, index: u32) {
-    let it = foliage_instance(lod, lod * globals.region_stride, index);
+/// (`eye` the camera's place in the record's world; `chain` the chain it is drawn through,
+/// `FOLIAGE_BOX_NO_CHAIN` directly.)
+fn foliage_expand(lod: u32, index: u32, eye: vec3<f32>, chain: u32) {
+    let it = foliage_instance(lod, lod * globals.region_stride, index, eye);
     if !it.blocky || !it.drawn {
         return;
     }
@@ -823,7 +873,7 @@ fn foliage_expand(lod: u32, index: u32) {
         let tip_from = 1.0 - 1.0 / f32(steps.x) - 1.0e-3;
         let first = foliage_box_room(count);
         for (var k = 0u; k < count; k++) {
-            foliage_box_write(first + k, it, block_path(b, j, cube, it.scale, leafy, k, max_steps).found, total, tip_from, b.seed, b.tint, lod);
+            foliage_box_write(first + k, it, block_path(b, j, cube, it.scale, leafy, k, max_steps).found, total, tip_from, b.seed, b.tint, lod, chain);
         }
     } else if lod == 2u {
         let first = foliage_box_room(it.n);
@@ -840,19 +890,19 @@ fn foliage_expand(lod: u32, index: u32) {
                 0.0,
                 top,
             );
-            foliage_box_write(first + s, it, bx, top, 1.0 - 1.0 / f32(max(steps.x, 1u)) - 1.0e-3, it.record.packed_colour_seed >> 16u, b.tint, lod);
+            foliage_box_write(first + s, it, bx, top, 1.0 - 1.0 / f32(max(steps.x, 1u)) - 1.0e-3, it.record.packed_colour_seed >> 16u, b.tint, lod, chain);
         }
     } else {
         let tuft_height = mix(ty.height_min, ty.height_max, f32(it.record.packed_scale_type & 0xffu) / 255.0) * it.scale;
         // At least a pixel and a half across: thinner, a far tuft is a sliver the
         // jittered samples find on some frames and miss on others (shimmer at the
         // horizon); as wide, it covers the share of the ground its tufts would.
-        let pixel = distance(it.root, cameras[0].position_near.xyz) * 2.0 / max(cameras[0].proj[1][1] * globals.screen_size.y, 1.0e-6);
+        let pixel = distance(it.root, eye) * 2.0 / max(cameras[0].proj[1][1] * globals.screen_size.y, 1.0e-6);
         let reach = max(0.5 * cube + tuft_height * mix(ty.lean_min, ty.lean_max, 0.6) * 0.8, 0.75 * pixel);
         let first = foliage_box_room(2u);
         for (var k = 0u; k < 2u; k++) {
             let half = select(vec2<f32>(0.5 * cube, reach), vec2<f32>(reach, 0.5 * cube), k == 0u);
-            foliage_box_write(first + k, it, Box(vec2<f32>(0.0), half, 0.0, tuft_height * 0.8), tuft_height * 0.8, 0.72, it.record.packed_colour_seed >> 16u, vec2<f32>(0.5), lod);
+            foliage_box_write(first + k, it, Box(vec2<f32>(0.0), half, 0.0, tuft_height * 0.8), tuft_height * 0.8, 0.72, it.record.packed_colour_seed >> 16u, vec2<f32>(0.5), lod, chain);
         }
     }
 }
@@ -861,29 +911,53 @@ fn foliage_expand(lod: u32, index: u32) {
 /// grid's threads striding over them.
 @compute @workgroup_size(64)
 fn cs_boxes(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
-    if arrayLength(&lod_draws) < 4u {
-        return;
-    }
-    let counts = vec4<u32>(lod_draws[0].y, lod_draws[1].y, lod_draws[2].y, lod_draws[3].y);
-    let total = counts.x + counts.y + counts.z + counts.w;
     let stride = groups.x * 64u;
+    let total = box_record_total();
     for (var i = id.x; i < total; i += stride) {
-        var lod = 0u;
-        var index = i;
-        if index >= counts.x {
-            index -= counts.x;
-            lod = 1u;
-            if index >= counts.y {
-                index -= counts.y;
-                lod = 2u;
-                if index >= counts.z {
-                    index -= counts.z;
-                    lod = 3u;
-                }
+        let at = box_record(i);
+        foliage_expand(at.x, at.y, cameras[0].position_near.xyz, FOLIAGE_BOX_NO_CHAIN);
+    }
+}
+
+/// [`cs_boxes`] over the occurrences: each record's boxes shaped seen from the camera's
+/// place in its chain's content, the chain kept in the box.
+@compute @workgroup_size(64)
+fn cs_boxes_occurrence(@builtin(global_invocation_id) id: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+    let stride = groups.x * 64u;
+    let total = box_record_total();
+    for (var i = id.x; i < total; i += stride) {
+        let at = box_record(i);
+        let chain = occurrence_chains[at.x * globals.region_stride + at.y];
+        foliage_expand(at.x, at.y, chain_views[chain].eye, chain);
+    }
+}
+
+/// Every LOD's visible records together (`lod_draws`' instance counts).
+fn box_record_total() -> u32 {
+    if arrayLength(&lod_draws) < 4u {
+        return 0u;
+    }
+    return lod_draws[0].y + lod_draws[1].y + lod_draws[2].y + lod_draws[3].y;
+}
+
+/// Record `i` of [`box_record_total`]: its LOD (x) and its index in that LOD's region (y).
+fn box_record(i: u32) -> vec2<u32> {
+    let counts = vec4<u32>(lod_draws[0].y, lod_draws[1].y, lod_draws[2].y, lod_draws[3].y);
+    var lod = 0u;
+    var index = i;
+    if index >= counts.x {
+        index -= counts.x;
+        lod = 1u;
+        if index >= counts.y {
+            index -= counts.y;
+            lod = 2u;
+            if index >= counts.z {
+                index -= counts.z;
+                lod = 3u;
             }
         }
-        foliage_expand(lod, index);
     }
+    return vec2<u32>(lod, index);
 }
 
 /// The box draw's arguments: nine corners a box, the boxes that fit.
@@ -898,22 +972,45 @@ fn cs_boxes_finish() {
 /// A box (`cs_boxes`): its three faces turned to the eye, a strip of nine corners.
 @vertex
 fn vs_box(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) instance_index: u32) -> VertexOutput {
+    var out = foliage_box_vertex(vertex_index, instance_index, cameras[0].position_near.xyz, FOLIAGE_IDENTITY, FOLIAGE_IDENTITY);
+    out.chain = 0u;
+    return out;
+}
+
+/// A box of what a portal chain shows (`cs_boxes_occurrence`), drawn through its chain.
+@vertex
+fn vs_box_occurrence(@builtin(vertex_index) vertex_index: u32, @builtin(instance_index) instance_index: u32) -> VertexOutput {
+    let chain_index = boxes[instance_index].tint >> 16u;
+    let chain = portal_chains[chain_index];
+    var out = foliage_box_vertex(vertex_index, instance_index, chain_views[chain_index].eye, chain.content_to_drawn, chain.prev_content_to_drawn);
+    out.chain = chain_index;
+    if portal_chain_moved(chain) {
+        out.moved = max(out.moved, 1.0);
+    }
+    return out;
+}
+
+/// Box `instance_index` seen from `eye` (its world's), drawn through `map` (`prev_map`
+/// last frame).
+fn foliage_box_vertex(vertex_index: u32, instance_index: u32, eye_at: vec3<f32>, map: mat4x4<f32>, prev_map: mat4x4<f32>) -> VertexOutput {
     let bx = boxes[instance_index];
     let basis = foliage_basis(tile_frames[bx.slot]);
     let heights = unpack2x16float(bx.heights);
     let shape = unpack2x16float(bx.shape);
-    let eye = cameras[0].position_near.xyz - bx.centre;
+    let eye = eye_at - bx.centre;
     let corner = box_vertex(Box(vec2<f32>(0.0), bx.half, heights.x, heights.y), vec2<f32>(dot(eye, basis.tangent), dot(eye, basis.bitangent)), min(vertex_index, 8u));
     let world = bx.centre + foliage_to_world(basis, corner.local);
     let ty = foliage_types[(bx.look >> 16u) & 0xffu];
     var out: VertexOutput;
     out.world_position = world + bx.now;
-    out.clip_position = cameras[0].view_proj * vec4<f32>(out.world_position, 1.0);
-    out.prev_clip_position = cameras[0].prev_view_proj * vec4<f32>(world + bx.prev, 1.0);
+    out.clip_position = cameras[0].view_proj * (map * vec4<f32>(out.world_position, 1.0));
+    out.prev_clip_position = cameras[0].prev_view_proj * (prev_map * vec4<f32>(world + bx.prev, 1.0));
     out.moved = length(bx.now - bx.prev);
-    // A blocky shape lights as the ground it grows on, its faces telling apart.
-    out.world_normal = basis.up;
-    out.face_normal = foliage_to_world(basis, corner.normal);
+    // A blocky shape lights as the ground it grows on, its faces telling apart; normals
+    // in the space drawn into.
+    let rotation = mat3x3<f32>(map[0].xyz, map[1].xyz, map[2].xyz);
+    out.world_normal = rotation * basis.up;
+    out.face_normal = rotation * foliage_to_world(basis, corner.normal);
     out.blocky = 1u;
     out.height_frac = clamp(corner.local.y / max(shape.x, 1.0e-3), 0.0, 1.0);
     out.tint = unpack4x8unorm(bx.tint).xy;
@@ -948,6 +1045,30 @@ fn foliage_velocity(clip_position: vec2<f32>, prev_clip: vec4<f32>) -> vec2<f32>
 @fragment
 fn fs_main(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> GBufferOutput {
     if HELIO_VIEW_CLIP && helio_view_clipped(cameras[0], input.world_position) { discard; }
+    return foliage_fragment(input, front_facing);
+}
+
+/// What a portal chain shows: kept only beyond its outermost opening where the aperture
+/// mask holds it, beyond each deeper opening the camera sees through, and not behind a
+/// deeper chain's opening; tagged with the chain's remap.
+@fragment
+fn fs_occurrence(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> GBufferOutput {
+    let chain = portal_chains[input.chain];
+    let p = input.world_position;
+    let mask = textureLoad(portal_mask, vec2<i32>(input.clip_position.xy), 0).r;
+    if !portal_outer_shows(chain, portal_stages[chain.first_stage], p, mask) { discard; }
+    for (var s = 1u; s < chain.stage_count; s += 1u) {
+        if !portal_stage_shows(portal_stages[chain.first_stage + s], p) { discard; }
+    }
+    for (var h = 0u; h < chain.hole_count; h += 1u) {
+        if portal_hole_covers(portal_stages[chain.first_hole + h], p) { discard; }
+    }
+    var out = foliage_fragment(input, front_facing);
+    out.surface = gbuffer_remap_tag(chain.remap, GBUFFER_TAG_OWN_OCCLUSION);
+    return out;
+}
+
+fn foliage_fragment(input: VertexOutput, front_facing: bool) -> GBufferOutput {
     // ── Colour ────────────────────────────────────────────────────────────────
     // The type's authored colour (a multiplier on the ground's for ground-coloured types,
     // so grass is the turf's colour), else the procedural root-to-tip green; varied per
@@ -1006,13 +1127,13 @@ fn fs_main(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> GB
     // Metallic workflow, as `gbuffer.wgsl` resolves it: F0 = mix(0.04, albedo, metallic).
     let f0 = mix(vec3<f32>(FOLIAGE_F0), albedo, metallic);
     out.albedo = vec4<f32>(albedo, 1.0);
-    out.normal = vec4<f32>(helio_view_normal(cameras[0], normal), f0.r);
+    out.normal = vec4<f32>(normal, f0.r);
     out.orm = vec4<f32>(ao, roughness, metallic, f0.g);
     out.emissive = vec4<f32>(0.0, 0.0, 0.0, f0.b);
     // w: 1 where the blade moved by itself, in the wind or pushed aside
     // (helio-pass-tsr MOTION_VECTORS); still, it moves with the camera.
     out.velocity = vec4<f32>(foliage_velocity(input.clip_position.xy, input.prev_clip_position), 0.0,
         select(0.0, 1.0, input.moved > 0.0));
-    out.surface = gbuffer_view_tag(cameras[0], GBUFFER_TAG_OWN_OCCLUSION);
+    out.surface = GBUFFER_TAG_OWN_OCCLUSION;
     return out;
 }

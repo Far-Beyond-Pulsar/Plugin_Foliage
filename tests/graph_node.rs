@@ -37,6 +37,14 @@ const NODES: &[(&str, &str, &str, bool)] = &[
         "FoliageGBufferPass",
         true,
     ),
+    // What portal chains show, drawn through them (a G-buffer drawer after the
+    // portals' mask).
+    (
+        "helio.pass.foliage_gbuffer_portal_occurrences",
+        "helio.foliage",
+        "FoliageGBufferPass",
+        true,
+    ),
 ];
 
 /// A pipeline the plugin's nodes are placed in.
@@ -57,7 +65,10 @@ const CASES: &[Case] = &[Case {
         "helio.pass.foliage_place",
         "helio.pass.foliage_boxes",
         "helio.pass.foliage_gbuffer",
+        "helio.pass.foliage_gbuffer_portal_occurrences",
     ],
+    // The draw through portals builds but is a member only while the frame
+    // has portal chains: not among the scene-less graph's passes.
     passes: &["FoliagePlacePass", "FoliageBoxesPass", "FoliageGBufferPass"],
 }];
 

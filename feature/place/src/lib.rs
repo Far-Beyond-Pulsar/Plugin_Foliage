@@ -139,6 +139,26 @@ pub const FOLIAGE_MAX_INTERACTORS: u32 = 16;
 /// here — worth revisiting if mobile ships, but not by making the stride dynamic.
 pub const FOLIAGE_VISIBLE_PER_LOD_CAPACITY: u32 = 1 << 20;
 
+/// Records one LOD's region of the occurrences (what portal chains show,
+/// `FoliagePlacePass::occurrence_blades`) holds: the chains' records share
+/// it, the nearest first-come; past it they are counted as overflow.
+pub const FOLIAGE_OCCURRENCES_PER_LOD: u32 = 1 << 18;
+
+/// A chain's eye set in [`GpuChainView`] when foliage keeps nothing resident
+/// for it: the chain draws no foliage.
+pub const NO_EYE_SET: u32 = u32::MAX;
+
+/// What foliage needs of one live portal chain (a row per row of
+/// `helio_portal_api::PORTAL_CHAINS`; `FoliageChainView` in the common
+/// snippet): the camera in the chain's content (frame space), and the eye set
+/// whose tiles it draws ([`NO_EYE_SET`]: none).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuChainView {
+    pub eye: [f32; 3],
+    pub eye_set: u32,
+}
+
 /// Byte offset of LOD `lod`'s region inside `visible_blades`.
 ///
 /// Part of the pinned interface contract with `FoliageGBufferPass`. Out-of-range input is

@@ -8,19 +8,29 @@ use helio_feature_api::{missing, pass_node, Feature, FeatureRegistrar};
 use helio_frame_api::{FrameNode, Phase};
 use helio_pass_foliage_place::{FoliagePlacePass, FoliageRange, FoliageSettings, OfferedGrounds};
 
-use crate::{FoliageBoxesPass, FoliageGBufferPass};
+use crate::{FoliageBoxesPass, FoliageGBufferPass, OccurrenceInputs};
 
-/// The foliage passes `settings` asks for: placement, the boxes expansion
-/// (between placement and the G-buffer) and the G-buffer draw (after it),
-/// which share the placement's buffers.
+/// The foliage passes `settings` asks for, which share the placement's buffers.
+pub struct FoliagePasses {
+    /// Placement and the culls (before the G-buffer phase).
+    pub place: FoliagePlacePass,
+    /// The boxes expansion of both draws (between placement and the G-buffer).
+    pub boxes: FoliageBoxesPass,
+    /// The frame's G-buffer draw.
+    pub draw: FoliageGBufferPass,
+    /// What portal chains show, drawn through them (after the portals' mask).
+    pub occurrences: FoliageGBufferPass,
+}
+
+/// The foliage passes `settings` asks for ([`FoliagePasses`]).
 pub fn foliage_passes(
     device: &wgpu::Device,
     settings: &FoliageSettings,
     stats: &helio_core::FrameStats,
     view: helio_core::ViewDescription,
-) -> (FoliagePlacePass, FoliageBoxesPass, FoliageGBufferPass) {
+) -> FoliagePasses {
     let defaults = FoliageRange::default();
-    let place = FoliagePlacePass::new_with(
+    let place = FoliagePlacePass::new_with_portal_eyes(
         device,
         settings.quality,
         stats,
@@ -30,6 +40,7 @@ pub fn foliage_passes(
             blades_per_tuft: settings.blades_per_tuft.unwrap_or(defaults.blades_per_tuft),
             ..defaults
         },
+        settings.portal_eyes,
     );
     let mut draw = FoliageGBufferPass::new(
         device,
@@ -43,16 +54,39 @@ pub fn foliage_passes(
         view,
     );
     draw.quality = settings.quality;
-    let boxes = draw.boxes_pass(device);
-    (place, boxes, draw)
+    let mut occurrences = FoliageGBufferPass::new_portal_occurrences(
+        device,
+        Arc::clone(&place.blade_arena),
+        Arc::clone(&place.tile_table),
+        Arc::clone(&place.tile_frames),
+        Arc::clone(&place.occurrence_blades),
+        Arc::clone(&place.occurrence_indirect),
+        Arc::clone(&place.bands_buffer),
+        Arc::clone(&place.interactors),
+        view,
+        OccurrenceInputs {
+            chains: Arc::clone(&place.occurrence_chains),
+            chain_views: Arc::clone(&place.chain_views),
+        },
+    );
+    occurrences.quality = settings.quality;
+    let mut boxes = draw.boxes_pass(device);
+    boxes.expand_for(device, &occurrences);
+    FoliagePasses {
+        place,
+        boxes,
+        draw,
+        occurrences,
+    }
 }
 
 /// What the placement node made for the nodes after it: the boxes expansion
-/// and the G-buffer draw, which share its buffers, each taken by its own node.
+/// and the G-buffer draws, which share its buffers, each taken by its own node.
 #[derive(Default)]
 struct PendingFoliage {
     boxes: Option<FoliageBoxesPass>,
     draw: Option<FoliageGBufferPass>,
+    occurrences: Option<FoliageGBufferPass>,
 }
 
 /// Foliage ([`crate`] and `helio_pass_foliage_place`).
@@ -109,16 +143,17 @@ impl Feature for FoliageFeature {
                     }
                     // The boxes and the draw share placement's buffers: made here,
                     // they wait for the Foliage Boxes and Foliage GBuffer nodes.
-                    let (place, boxes, draw) = foliage_passes(
+                    let passes = foliage_passes(
                         build.env.device,
                         &settings,
                         build.env.stats,
                         helio_frame_api::view::view_of(build.env),
                     );
-                    build.graph.add_pass(Box::new(place));
+                    build.graph.add_pass(Box::new(passes.place));
                     let pending = build.env.shared(PendingFoliage::default);
-                    pending.boxes = Some(boxes);
-                    pending.draw = Some(draw);
+                    pending.boxes = Some(passes.boxes);
+                    pending.draw = Some(passes.draw);
+                    pending.occurrences = Some(passes.occurrences);
                     Ok(())
                 },
             )
@@ -175,6 +210,34 @@ impl Feature for FoliageFeature {
                 },
             )
             .drawer(Phase::GBuffer, 20),
+        );
+
+        registrar.node(
+            pass_node(
+                "foliage_gbuffer_portal_occurrences",
+                "Foliage: Draw Through Portals",
+                CATEGORY,
+                "Rasterises the foliage portal chains show, through each chain, into the \
+                 GBuffer after the portals' mask. A member while the frame has portal chains. \
+                 Needs Foliage Placement before it.",
+                |build| {
+                    let enabled = build
+                        .env
+                        .setting::<FoliageSettings>()
+                        .is_none_or(|settings| settings.enabled);
+                    if !enabled {
+                        return Ok(());
+                    }
+                    let draw = build
+                        .env
+                        .shared_existing::<PendingFoliage>()
+                        .and_then(|pending| pending.occurrences.take())
+                        .ok_or_else(|| missing("Foliage Through Portals", "Foliage Placement"))?;
+                    build.graph.add_pass(Box::new(draw));
+                    Ok(())
+                },
+            )
+            .drawer(Phase::GBuffer, helio_portal_api::OCCURRENCE_ORDER),
         );
     }
 }

@@ -16,7 +16,13 @@ helio-frame-api = { workspace = true }
 helio-feature-api = { workspace = true }
 helio-core         = { workspace = true }
 helio-pass-foliage-place = { workspace = true }
+# What portal chains show: their rows, mask and snippet, drawn through.
+helio-portal-api = { workspace = true }
 wgpu               = { workspace = true }
 bytemuck           = { workspace = true, features = ["derive"] }
 log                = { workspace = true }
 pulsar_scenedb = { workspace = true }
+
+[dev-dependencies]
+# The shaders validate without a GPU (tests/shaders_validate.rs).
+naga = { version = "30", features = ["wgsl-in"] }

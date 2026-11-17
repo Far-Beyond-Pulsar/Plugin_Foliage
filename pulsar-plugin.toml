@@ -10,7 +10,9 @@ provides = [
     { id = "pulsar.foliage.rows", kind = "buffer", members = ["foliage_types", "foliage_layers", "foliage_interactors", "foliage_wind"], version = 1 },
     { id = "pulsar.foliage.api", kind = "api", members = ["helio-foliage-api"], version = 1 },
 ]
-requires = []
+requires = [
+    { id = "pulsar.portals.api", optional = true },
+]
 
 # The plugin's root crate (the package in this directory): the one place it
 # registers everything it contributes. A game links it without its `editor`

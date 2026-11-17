@@ -385,11 +385,34 @@ pub fn lod_draws(level: u32, distance: f32, boundary: f32, band: f32, unit: f32)
 // The pass
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// What the occurrence draw reads besides the records (`FoliagePlacePass`'s): each
+/// occurrence's chain (`occurrence_chains`) and each chain's view (`chain_views`).
+pub struct OccurrenceInputs {
+    pub chains: Arc<wgpu::Buffer>,
+    pub chain_views: Arc<wgpu::Buffer>,
+}
+
+/// The occurrence draw's own state: its inputs, the chains' bind group (group 3, rebuilt
+/// when the portals' rows or mask are replaced) and whether the frame has chains.
+struct Occurrences {
+    inputs: OccurrenceInputs,
+    layout_3: wgpu::BindGroupLayout,
+    group_3: Option<(
+        (wgpu::Buffer, wgpu::Buffer, wgpu::TextureView),
+        wgpu::BindGroup,
+    )>,
+    live: bool,
+}
+
 /// Rasterises grass blades and cards into the shared G-buffer.
 ///
 /// Construct it with the four buffers `FoliagePlacePass` owns, following the
 /// `ShadowDirtyPass` → `ShadowCullPass` handoff in `helio-presets`: the producer
 /// pass is built first and its `Arc<wgpu::Buffer>` fields are cloned into the consumer.
+///
+/// [`Self::new_portal_occurrences`] makes the same draw over what portal chains show
+/// (`helio_portal_api`): the producer's occurrence lists in place of its visible list,
+/// each record drawn through its chain and clipped to what the chain shows.
 pub struct FoliageGBufferPass {
     pipeline: wgpu::RenderPipeline,
     /// Blocky foliage: the boxes `FoliageBoxesPass` expands, nine corners each.
@@ -448,6 +471,8 @@ pub struct FoliageGBufferPass {
     /// Global multiplier on how far interactors (`FoliageInteractorRow` rows) press
     /// foliage over.
     pub interaction_strength: f32,
+    /// The occurrence draw ([`Self::new_portal_occurrences`]); `None` for the frame's.
+    occurrences: Option<Occurrences>,
 }
 
 impl FoliageGBufferPass {
@@ -473,6 +498,64 @@ impl FoliageGBufferPass {
         interactors: Arc<wgpu::Buffer>,
         view: helio_core::ViewDescription,
     ) -> Self {
+        Self::build(
+            device,
+            [
+                blade_arena,
+                tile_table,
+                tile_frames,
+                visible_blades,
+                foliage_indirect,
+                bands,
+                interactors,
+            ],
+            view,
+            None,
+        )
+    }
+
+    /// The draw of what portal chains show: `FoliagePlacePass`'s buffers as for
+    /// [`Self::new`] with its occurrence lists (`occurrence_blades`,
+    /// `occurrence_indirect`) in place of the visible list and its draws, and
+    /// `occurrences`' chains. A G-buffer drawer after the portals' mask
+    /// (`helio_portal_api::OCCURRENCE_ORDER`), a member while the frame has chains.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_portal_occurrences(
+        device: &wgpu::Device,
+        blade_arena: Arc<wgpu::Buffer>,
+        tile_table: Arc<wgpu::Buffer>,
+        tile_frames: Arc<wgpu::Buffer>,
+        occurrence_blades: Arc<wgpu::Buffer>,
+        occurrence_indirect: Arc<wgpu::Buffer>,
+        bands: Arc<wgpu::Buffer>,
+        interactors: Arc<wgpu::Buffer>,
+        view: helio_core::ViewDescription,
+        occurrences: OccurrenceInputs,
+    ) -> Self {
+        Self::build(
+            device,
+            [
+                blade_arena,
+                tile_table,
+                tile_frames,
+                occurrence_blades,
+                occurrence_indirect,
+                bands,
+                interactors,
+            ],
+            view,
+            Some(occurrences),
+        )
+    }
+
+    fn build(
+        device: &wgpu::Device,
+        producer: [Arc<wgpu::Buffer>; 7],
+        view: helio_core::ViewDescription,
+        occurrences: Option<OccurrenceInputs>,
+    ) -> Self {
+        let [blade_arena, tile_table, tile_frames, visible_blades, foliage_indirect, bands, interactors] =
+            producer;
         // ── Region stride ─────────────────────────────────────────────────────
         // Derived from the buffer the producer sized, so there is no third place for
         // the two sides to disagree. `max(1)` keeps a degenerate (test-sized) buffer
@@ -566,17 +649,31 @@ impl FoliageGBufferPass {
             device,
             "FoliageGBuffer Shader",
             helio_core::include_wgsl!("../shaders/foliage_gbuffer.wgsl"),
-            &[
-                helio_pass_foliage_place::WIND_SNIPPET,
-                helio_pass_foliage_place::COMMON_SNIPPET,
-                helio_frame_api::gbuffer::OUTPUT_SNIPPET,
-            ],
+            &SHADER_SNIPPETS,
         );
+        // The occurrence draw adds the chains (group 3; group 2 is the boxes
+        // expansion's).
+        let layout_3 = occurrences
+            .as_ref()
+            .map(|_| layout_3(device, "FoliageGBuffer BGL 3", true));
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("FoliageGBuffer PL"),
-            bind_group_layouts: &[Some(&bind_group_layout_0), Some(&bind_group_layout_1)],
+            bind_group_layouts: &match &layout_3 {
+                Some(layout_3) => vec![
+                    Some(&bind_group_layout_0),
+                    Some(&bind_group_layout_1),
+                    None,
+                    Some(layout_3),
+                ],
+                None => vec![Some(&bind_group_layout_0), Some(&bind_group_layout_1)],
+            },
             immediate_size: 0,
         });
+        let fragment_entry = if occurrences.is_some() {
+            "fs_occurrence"
+        } else {
+            "fs_main"
+        };
         let targets = color_target_states();
         let raster = |label: &str, entry: &str| {
             helio_core::shader::create_render_pipeline(
@@ -594,7 +691,7 @@ impl FoliageGBufferPass {
                     },
                     fragment: Some(wgpu::FragmentState {
                         module: &shader,
-                        entry_point: Some("fs_main"),
+                        entry_point: Some(fragment_entry),
                         // The view's clip (`helio_frame_api::view`): compiled in
                         // only where the view has one.
                         compilation_options: wgpu::PipelineCompilationOptions {
@@ -634,8 +731,28 @@ impl FoliageGBufferPass {
                 },
             )
         };
-        let pipeline = raster("FoliageGBuffer Pipeline", "vs_main");
-        let box_pipeline = raster("FoliageGBuffer Box Pipeline", "vs_box");
+        let (pipeline, box_pipeline) = if occurrences.is_some() {
+            (
+                raster("FoliageGBuffer Occurrence Pipeline", "vs_occurrence"),
+                raster(
+                    "FoliageGBuffer Occurrence Box Pipeline",
+                    "vs_box_occurrence",
+                ),
+            )
+        } else {
+            (
+                raster("FoliageGBuffer Pipeline", "vs_main"),
+                raster("FoliageGBuffer Box Pipeline", "vs_box"),
+            )
+        };
+        let occurrences = occurrences
+            .zip(layout_3)
+            .map(|(inputs, layout_3)| Occurrences {
+                inputs,
+                layout_3,
+                group_3: None,
+                live: false,
+            });
 
         Self {
             pipeline,
@@ -665,6 +782,7 @@ impl FoliageGBufferPass {
             quality: FoliageQuality::default(),
             lod_fade_band: 4.0,
             interaction_strength: 1.0,
+            occurrences,
         }
     }
 
@@ -713,7 +831,22 @@ impl RenderPass for FoliageGBufferPass {
     }
 
     fn name(&self) -> &'static str {
-        "FoliageGBuffer"
+        if self.occurrences.is_some() {
+            "FoliageGBufferPortalOccurrences"
+        } else {
+            "FoliageGBuffer"
+        }
+    }
+
+    /// The occurrence draw is a member while the frame has portal chains.
+    fn is_member(&mut self, scene: &mut helio_core::SceneContent<'_>) -> bool {
+        let Some(occurrences) = self.occurrences.as_mut() else {
+            return true;
+        };
+        if let Some(buffers) = scene.scene_buffers() {
+            occurrences.live = helio_portal_api::portal_chain_set(buffers).is_some();
+        }
+        occurrences.live
     }
 
     fn reads(&self) -> &'static [&'static str] {
@@ -737,6 +870,12 @@ impl RenderPass for FoliageGBufferPass {
         // does. Declaring a second writer would allocate a second set of textures and
         // the fusion this pass is positioned for would become impossible.
         builder.read(helio_frame_api::gbuffer::GROUP);
+        if self.occurrences.is_some() {
+            // What the portals publish: drawn after their mask.
+            builder.read_optional(helio_portal_api::PORTAL_MASK);
+            builder.read_optional(helio_portal_api::PORTAL_CHAINS);
+            builder.read_optional(helio_portal_api::PORTAL_STAGES);
+        }
     }
 
     fn render_pass_descriptor_with_storage<'a>(
@@ -1028,6 +1167,47 @@ impl RenderPass for FoliageGBufferPass {
             self.bind_group_0_key = Some(key);
         }
 
+        // ── The chains (the occurrence draw) ─────────────────────────────────
+        if let Some(occurrences) = self.occurrences.as_mut() {
+            let chains = ctx
+                .registry
+                .get::<&wgpu::Buffer>(helio_core::ResourceKey::new(
+                    helio_portal_api::PORTAL_CHAINS,
+                ));
+            let stages = ctx
+                .registry
+                .get::<&wgpu::Buffer>(helio_core::ResourceKey::new(
+                    helio_portal_api::PORTAL_STAGES,
+                ));
+            let mask = ctx.resource_pool.get_view(helio_portal_api::PORTAL_MASK);
+            let (Some(chains), Some(stages), Some(mask)) = (chains, stages, mask) else {
+                return Ok(());
+            };
+            let key = (chains.clone(), stages.clone(), mask.clone());
+            if occurrences.group_3.as_ref().is_none_or(|(k, _)| *k != key) {
+                let group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("FoliageGBuffer BG 3"),
+                    layout: &occurrences.layout_3,
+                    entries: &[
+                        entry(0, &occurrences.inputs.chains),
+                        entry(1, chains),
+                        entry(2, stages),
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(mask),
+                        },
+                        entry(4, &occurrences.inputs.chain_views),
+                    ],
+                });
+                occurrences.group_3 = Some((key, group));
+            }
+            pass.set_bind_group(
+                3,
+                &occurrences.group_3.as_ref().expect("built above").1,
+                &[],
+            );
+        }
+
         // ── Four draws, one per LOD ───────────────────────────────────────────
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, self.bind_group_0.as_ref().unwrap(), &[]);
@@ -1100,59 +1280,106 @@ fn layout_0(device: &wgpu::Device, label: &str, boxes: bool) -> wgpu::BindGroupL
     })
 }
 
+/// The snippets the foliage G-buffer module (draw and boxes) includes.
+const SHADER_SNIPPETS: [helio_core::shader::ShaderSnippet; 4] = [
+    helio_pass_foliage_place::WIND_SNIPPET,
+    helio_pass_foliage_place::COMMON_SNIPPET,
+    helio_frame_api::gbuffer::OUTPUT_SNIPPET,
+    helio_portal_api::PORTAL_CHAIN_SNIPPET,
+];
+
+/// Group 3 of the occurrence draw (`draw`: the chains' rows, the aperture mask, each
+/// occurrence's chain and the chains' views) or of the occurrence boxes expansion
+/// (each occurrence's chain and the chains' views).
+fn layout_3(device: &wgpu::Device, label: &str, draw: bool) -> wgpu::BindGroupLayout {
+    let storage = |binding: u32, visibility: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let raster = wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT;
+    let entries = if draw {
+        vec![
+            storage(0, raster),
+            storage(1, raster),
+            storage(2, raster),
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Uint,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            storage(4, raster),
+        ]
+    } else {
+        vec![
+            storage(0, wgpu::ShaderStages::COMPUTE),
+            storage(4, wgpu::ShaderStages::COMPUTE),
+        ]
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(label),
+        entries: &entries,
+    })
+}
+
 impl FoliageGBufferPass {
     /// The compute pass that expands this pass's blocky foliage into boxes each frame:
     /// add it to the graph after `FoliagePlacePass` and before `GBufferPass` (between the
-    /// two raster passes it would break their fusion).
+    /// two raster passes it would break their fusion). [`FoliageBoxesPass::expand_for`]
+    /// adds another draw's (the occurrence draw's) to the same pass.
     pub fn boxes_pass(&self, device: &wgpu::Device) -> FoliageBoxesPass {
-        FoliageBoxesPass::new(
-            device,
-            Arc::clone(&self.globals_buf),
-            [
-                &self.blade_arena,
-                &self.tile_table,
-                &self.tile_frames,
-                &self.visible_blades,
-                &self.foliage_indirect,
-                &self.bands,
-                &self.interactors,
-            ]
-            .map(Arc::clone),
-            Arc::clone(&self.boxes),
-            Arc::clone(&self.box_state),
-        )
+        let mut pass = FoliageBoxesPass::new(device);
+        pass.expand_for(device, self);
+        pass
     }
 }
 
 /// Expands each frame's visible blocky foliage into boxes (`cs_boxes`): everything a box
 /// shares — its record, blade and staircase, the wind and interactors at its centre — is
 /// worked out once a box here instead of once a vertex in the draw, which places nine
-/// corners a box (`vs_box`). Made by [`FoliageGBufferPass::boxes_pass`].
+/// corners a box (`vs_box`). Made by [`FoliageGBufferPass::boxes_pass`]; one expansion
+/// per draw it serves (the frame's, and what portal chains show).
 pub struct FoliageBoxesPass {
-    expand: wgpu::ComputePipeline,
+    shader: wgpu::ShaderModule,
+    layout: wgpu::PipelineLayout,
+    occurrence_layout: wgpu::PipelineLayout,
     finish: wgpu::ComputePipeline,
     layout_0: wgpu::BindGroupLayout,
+    layout_2: wgpu::BindGroupLayout,
+    layout_3: wgpu::BindGroupLayout,
     empty_group: wgpu::BindGroup,
-    group_2: wgpu::BindGroup,
-    group_0: Option<((wgpu::Buffer, wgpu::Buffer, wgpu::Buffer), wgpu::BindGroup)>,
-    globals: Arc<wgpu::Buffer>,
-    /// Blade arena, tile table, tile frames, visible list, the cull's draws, bands and
-    /// interactors (`FoliagePlacePass`'s).
-    producer: [Arc<wgpu::Buffer>; 7],
-    box_state: Arc<wgpu::Buffer>,
+    expansions: Vec<BoxExpansion>,
     placeholder_wind: wgpu::Buffer,
     placeholder_type: wgpu::Buffer,
     active: bool,
 }
 
+/// One draw's boxes: its pipeline (`cs_boxes`, or `cs_boxes_occurrence` with the chains in
+/// group 3), its buffers and bind groups.
+struct BoxExpansion {
+    expand: wgpu::ComputePipeline,
+    group_0: Option<((wgpu::Buffer, wgpu::Buffer, wgpu::Buffer), wgpu::BindGroup)>,
+    group_2: wgpu::BindGroup,
+    group_3: Option<wgpu::BindGroup>,
+    globals: Arc<wgpu::Buffer>,
+    /// Blade arena, tile table, tile frames, visible list, the cull's draws, bands and
+    /// interactors (`FoliagePlacePass`'s, as the draw reads them).
+    producer: [Arc<wgpu::Buffer>; 7],
+    box_state: Arc<wgpu::Buffer>,
+}
+
 impl FoliageBoxesPass {
-    fn new(
-        device: &wgpu::Device,
-        globals: Arc<wgpu::Buffer>,
-        producer: [Arc<wgpu::Buffer>; 7],
-        boxes: Arc<wgpu::Buffer>,
-        box_state: Arc<wgpu::Buffer>,
-    ) -> Self {
+    fn new(device: &wgpu::Device) -> Self {
         let layout_0 = layout_0(device, "FoliageBoxes BGL 0", false);
         let empty_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("FoliageBoxes BGL 1"),
@@ -1172,56 +1399,32 @@ impl FoliageBoxesPass {
             label: Some("FoliageBoxes BGL 2"),
             entries: &[storage(0, false), storage(1, false), storage(2, true)],
         });
+        let layout_3 = layout_3(device, "FoliageBoxes BGL 3", false);
         let shader = helio_core::shader::module_with(
             device,
             "FoliageBoxes Shader",
             helio_core::include_wgsl!("../shaders/foliage_gbuffer.wgsl"),
-            &[
-                helio_pass_foliage_place::WIND_SNIPPET,
-                helio_pass_foliage_place::COMMON_SNIPPET,
-                helio_frame_api::gbuffer::OUTPUT_SNIPPET,
-            ],
+            &SHADER_SNIPPETS,
         );
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("FoliageBoxes PL"),
             bind_group_layouts: &[Some(&layout_0), Some(&empty_layout), Some(&layout_2)],
             immediate_size: 0,
         });
-        let pipeline = |label: &str, entry: &str| {
-            helio_core::shader::create_compute_pipeline(
-                &device,
-                wgpu::ComputePipelineDescriptor {
-                    label: Some(label),
-                    layout: Some(&layout),
-                    module: &shader,
-                    entry_point: Some(entry),
-                    compilation_options: Default::default(),
-                    cache: None,
-                },
-            )
-        };
+        let occurrence_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("FoliageBoxes Occurrence PL"),
+            bind_group_layouts: &[
+                Some(&layout_0),
+                Some(&empty_layout),
+                Some(&layout_2),
+                Some(&layout_3),
+            ],
+            immediate_size: 0,
+        });
         let empty_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("FoliageBoxes BG 1"),
             layout: &empty_layout,
             entries: &[],
-        });
-        let group_2 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("FoliageBoxes BG 2"),
-            layout: &layout_2,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: boxes.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: box_state.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: producer[4].as_entire_binding(),
-                },
-            ],
         });
         let placeholder = |label: &str, size: u64| {
             device.create_buffer(&wgpu::BufferDescriptor {
@@ -1231,16 +1434,23 @@ impl FoliageBoxesPass {
                 mapped_at_creation: false,
             })
         };
+        let finish = compute_pipeline(
+            device,
+            "FoliageBoxes Finish",
+            &layout,
+            &shader,
+            "cs_boxes_finish",
+        );
         Self {
-            expand: pipeline("FoliageBoxes Expand", "cs_boxes"),
-            finish: pipeline("FoliageBoxes Finish", "cs_boxes_finish"),
+            shader,
+            layout,
+            occurrence_layout,
+            finish,
             layout_0,
+            layout_2,
+            layout_3,
             empty_group,
-            group_2,
-            group_0: None,
-            globals,
-            producer,
-            box_state,
+            expansions: Vec::new(),
             placeholder_wind: placeholder(
                 "FoliageBoxes/WindPlaceholder",
                 std::mem::size_of::<helio_pass_foliage_place::GpuWind>() as u64,
@@ -1252,6 +1462,87 @@ impl FoliageBoxesPass {
             active: false,
         }
     }
+
+    /// Expand `draw`'s blocky foliage too: its records into its boxes, each frame.
+    pub fn expand_for(&mut self, device: &wgpu::Device, draw: &FoliageGBufferPass) {
+        let producer = [
+            &draw.blade_arena,
+            &draw.tile_table,
+            &draw.tile_frames,
+            &draw.visible_blades,
+            &draw.foliage_indirect,
+            &draw.bands,
+            &draw.interactors,
+        ]
+        .map(Arc::clone);
+        let group_2 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("FoliageBoxes BG 2"),
+            layout: &self.layout_2,
+            entries: &[
+                entry(0, &draw.boxes),
+                entry(1, &draw.box_state),
+                entry(2, &producer[4]),
+            ],
+        });
+        let (expand, group_3) = match &draw.occurrences {
+            Some(occurrences) => (
+                compute_pipeline(
+                    device,
+                    "FoliageBoxes Occurrence Expand",
+                    &self.occurrence_layout,
+                    &self.shader,
+                    "cs_boxes_occurrence",
+                ),
+                Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("FoliageBoxes BG 3"),
+                    layout: &self.layout_3,
+                    entries: &[
+                        entry(0, &occurrences.inputs.chains),
+                        entry(4, &occurrences.inputs.chain_views),
+                    ],
+                })),
+            ),
+            None => (
+                compute_pipeline(
+                    device,
+                    "FoliageBoxes Expand",
+                    &self.layout,
+                    &self.shader,
+                    "cs_boxes",
+                ),
+                None,
+            ),
+        };
+        self.expansions.push(BoxExpansion {
+            expand,
+            group_0: None,
+            group_2,
+            group_3,
+            globals: Arc::clone(&draw.globals_buf),
+            producer,
+            box_state: Arc::clone(&draw.box_state),
+        });
+    }
+}
+
+fn compute_pipeline(
+    device: &wgpu::Device,
+    label: &str,
+    layout: &wgpu::PipelineLayout,
+    module: &wgpu::ShaderModule,
+    entry: &str,
+) -> wgpu::ComputePipeline {
+    helio_core::shader::create_compute_pipeline(
+        device,
+        wgpu::ComputePipelineDescriptor {
+            label: Some(label),
+            layout: Some(layout),
+            module,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: None,
+        },
+    )
 }
 
 impl RenderPass for FoliageBoxesPass {
@@ -1304,39 +1595,48 @@ impl RenderPass for FoliageBoxesPass {
             .map(|h| &h.buffer)
             .unwrap_or(&self.placeholder_type);
         let key = (ctx.camera.clone(), wind.clone(), types.clone());
-        if self.group_0.as_ref().is_none_or(|(k, _)| *k != key) {
-            let [blades, tiles, frames, visible, _, bands, interactors] = &self.producer;
-            let group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("FoliageBoxes BG 0"),
-                layout: &self.layout_0,
-                entries: &[
-                    entry(0, ctx.camera),
-                    entry(1, &self.globals),
-                    entry(2, wind),
-                    entry(3, types),
-                    entry(4, blades),
-                    entry(5, tiles),
-                    entry(6, visible),
-                    entry(7, interactors),
-                    entry(9, frames),
-                    entry(10, bands),
-                ],
-            });
-            self.group_0 = Some((key, group));
+        for expansion in &mut self.expansions {
+            if expansion.group_0.as_ref().is_none_or(|(k, _)| *k != key) {
+                let [blades, tiles, frames, visible, _, bands, interactors] = &expansion.producer;
+                let group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("FoliageBoxes BG 0"),
+                    layout: &self.layout_0,
+                    entries: &[
+                        entry(0, ctx.camera),
+                        entry(1, &expansion.globals),
+                        entry(2, wind),
+                        entry(3, types),
+                        entry(4, blades),
+                        entry(5, tiles),
+                        entry(6, visible),
+                        entry(7, interactors),
+                        entry(9, frames),
+                        entry(10, bands),
+                    ],
+                });
+                expansion.group_0 = Some((key.clone(), group));
+            }
         }
         let mut encoder = ctx.graphics_cmds();
-        encoder.clear_buffer(&self.box_state, 0, Some(BOX_DRAW_OFFSET));
+        for expansion in &self.expansions {
+            encoder.clear_buffer(&expansion.box_state, 0, Some(BOX_DRAW_OFFSET));
+        }
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Foliage Boxes"),
             timestamp_writes: None,
         });
-        pass.set_bind_group(0, &self.group_0.as_ref().unwrap().1, &[]);
         pass.set_bind_group(1, &self.empty_group, &[]);
-        pass.set_bind_group(2, &self.group_2, &[]);
-        pass.set_pipeline(&self.expand);
-        pass.dispatch_workgroups(BOX_GROUPS, 1, 1);
-        pass.set_pipeline(&self.finish);
-        pass.dispatch_workgroups(1, 1, 1);
+        for expansion in &self.expansions {
+            pass.set_bind_group(0, &expansion.group_0.as_ref().unwrap().1, &[]);
+            pass.set_bind_group(2, &expansion.group_2, &[]);
+            if let Some(group_3) = &expansion.group_3 {
+                pass.set_bind_group(3, group_3, &[]);
+            }
+            pass.set_pipeline(&expansion.expand);
+            pass.dispatch_workgroups(BOX_GROUPS, 1, 1);
+            pass.set_pipeline(&self.finish);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
         Ok(())
     }
 }
