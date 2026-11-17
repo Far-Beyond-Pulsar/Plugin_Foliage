@@ -162,7 +162,7 @@ impl From<FoliageLayerRow> for GpuFoliageLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytemuck::Zeroable;
+
     #[test]
     fn scene_records_preserve_gpu_abi() {
         assert_eq!(std::mem::size_of::<FoliageTypeRow>(), 128);
