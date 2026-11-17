@@ -68,7 +68,6 @@ struct App {
 struct AppState {
     window: Arc<Window>,
     graphics: HelioGraphicsContext<'static>,
-    device: Arc<wgpu::Device>,
     renderer: Renderer,
     last_frame: std::time::Instant,
     start_time: std::time::Instant,
@@ -87,7 +86,6 @@ struct AppState {
     interactor_entity: Entity,
     wind_entity: Entity,
     interactor_prev_pos: glam::Vec3,
-    marker_object: Entity,
 
     _sun_light_id: Entity,
 
@@ -227,7 +225,7 @@ impl ApplicationHandler for App {
         let mut scene_db = new_scene_db_with_gpu_mirror(&device, &queue);
         let builder = RendererBuilder::new(config.clone(), scene_db_handle(&scene_db))
             .with_graph(common::preset());
-        let (mut renderer, xr_input) = graphics.build_renderer(builder, config).expect("renderer");
+        let (renderer, xr_input) = graphics.build_renderer(builder, config).expect("renderer");
         let xr_active = graphics.is_xr();
 
         // Indoors, but the sky still drives ambient. `AtmospherePass` is in every graph
@@ -270,7 +268,7 @@ impl ApplicationHandler for App {
             make_material([0.8, 0.2, 0.15, 1.0], 0.4, 0.0, [0.5, 0.05, 0.0], 2.0),
         );
         let marker_mesh = spawn_mesh(&mut scene_db.world, sphere_mesh([0.0, 0.0, 0.0], 0.6));
-        let marker_object = spawn_object(
+        spawn_object(
             &mut scene_db.world,
             marker_mesh,
             marker_mat,
@@ -366,7 +364,6 @@ impl ApplicationHandler for App {
         let state = AppState {
             window,
             graphics,
-            device,
             renderer,
             last_frame: std::time::Instant::now(),
             start_time: std::time::Instant::now(),
@@ -383,7 +380,6 @@ impl ApplicationHandler for App {
             interactor_entity,
             wind_entity,
             interactor_prev_pos: glam::Vec3::ZERO,
-            marker_object,
             _sun_light_id: sun_light_id,
             xr_active,
             xr_input,
