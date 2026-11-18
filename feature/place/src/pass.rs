@@ -1081,7 +1081,11 @@ impl FoliagePlacePass {
         for set in &mut self.sets[1..] {
             if set
                 .key
-                .is_some_and(|key| !chains.iter().any(|chain| chain.key == key))
+                .is_some_and(|key| {
+                    !chains
+                        .iter()
+                        .any(|chain| chain.key == key && chain.destination_space == 0)
+                })
             {
                 set.key = None;
             }
@@ -1089,6 +1093,14 @@ impl FoliagePlacePass {
         let count = chains.len().min(helio_portal_api::MAX_CHAINS as usize);
         self.chain_views_scratch.clear();
         for chain in &chains[..count] {
+            // Generated terrain foliage belongs to the ordinary world.
+            if chain.destination_space != 0 {
+                self.chain_views_scratch.push(crate::GpuChainView {
+                    eye: chain.content_eye.to_array(),
+                    eye_set: crate::NO_EYE_SET,
+                });
+                continue;
+            }
             let at = origin + chain.content_eye.as_dvec3();
             let near = |set: &EyeSet| set.eye.is_some_and(|e| e.distance(at) <= reach);
             let set = if near(&self.sets[0]) {
