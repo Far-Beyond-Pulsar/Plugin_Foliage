@@ -1281,10 +1281,11 @@ fn layout_0(device: &wgpu::Device, label: &str, boxes: bool) -> wgpu::BindGroupL
 }
 
 /// The snippets the foliage G-buffer module (draw and boxes) includes.
-const SHADER_SNIPPETS: [helio_core::shader::ShaderSnippet; 4] = [
+const SHADER_SNIPPETS: [helio_core::shader::ShaderSnippet; 5] = [
     helio_pass_foliage_place::WIND_SNIPPET,
     helio_pass_foliage_place::COMMON_SNIPPET,
     helio_frame_api::gbuffer::OUTPUT_SNIPPET,
+    helio_frame_api::gbuffer::SURFACE_SNIPPET,
     helio_portal_api::PORTAL_CHAIN_SNIPPET,
 ];
 
