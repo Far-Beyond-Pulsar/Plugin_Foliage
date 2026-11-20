@@ -1,4 +1,5 @@
 //!use gbuffer_output
+//!use frame_surface
 //!use helio_prelude
 //!use helio_foliage_wind
 //!use helio_foliage_common
@@ -1111,7 +1112,6 @@ fn foliage_fragment(input: VertexOutput, front_facing: bool) -> GBufferOutput {
     // own canopy.
     let ao = mix(0.45, 1.0, input.height_frac);
 
-    var out: GBufferOutput;
     if (globals.flags & FOLIAGE_FLAG_DEBUG_LOD) != 0u {
         var lod_colour = vec3<f32>(1.0, 0.0, 0.0);
         if input.lod == 1u {
@@ -1125,15 +1125,12 @@ fn foliage_fragment(input: VertexOutput, front_facing: bool) -> GBufferOutput {
     }
 
     // Metallic workflow, as `gbuffer.wgsl` resolves it: F0 = mix(0.04, albedo, metallic).
-    let f0 = mix(vec3<f32>(FOLIAGE_F0), albedo, metallic);
-    out.albedo = vec4<f32>(albedo, 1.0);
-    out.normal = vec4<f32>(normal, f0.r);
-    out.orm = vec4<f32>(ao, roughness, metallic, f0.g);
-    out.emissive = vec4<f32>(0.0, 0.0, 0.0, f0.b);
+    var surface = surface_data(albedo, normal, roughness, metallic, vec3<f32>(0.0));
+    surface.ao = ao;
+    surface.specular_f0 = mix(vec3<f32>(FOLIAGE_F0), albedo, metallic);
     // w: 1 where the blade moved by itself, in the wind or pushed aside
     // (helio-pass-tsr MOTION_VECTORS); still, it moves with the camera.
-    out.velocity = vec4<f32>(foliage_velocity(input.clip_position.xy, input.prev_clip_position), 0.0,
+    let velocity = vec4<f32>(foliage_velocity(input.clip_position.xy, input.prev_clip_position), 0.0,
         select(0.0, 1.0, input.moved > 0.0));
-    out.surface = GBUFFER_TAG_OWN_OCCLUSION;
-    return out;
+    return gbuffer_output(surface, GBUFFER_TAG_OWN_OCCLUSION, velocity);
 }
