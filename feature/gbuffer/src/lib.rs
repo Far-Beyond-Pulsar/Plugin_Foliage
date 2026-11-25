@@ -414,9 +414,9 @@ struct Occurrences {
 /// (`helio_portal_api`): the producer's occurrence lists in place of its visible list,
 /// each record drawn through its chain and clipped to what the chain shows.
 pub struct FoliageGBufferPass {
-    pipeline: wgpu::RenderPipeline,
+    pipeline: helio_core::shader::DeferredRender,
     /// Blocky foliage: the boxes `FoliageBoxesPass` expands, nine corners each.
-    box_pipeline: wgpu::RenderPipeline,
+    box_pipeline: helio_core::shader::DeferredRender,
     bind_group_layout_0: wgpu::BindGroupLayout,
 
     // ── Producer-owned buffers (the pinned contract) ─────────────────────────
@@ -676,7 +676,7 @@ impl FoliageGBufferPass {
         };
         let targets = color_target_states();
         let raster = |label: &str, entry: &str| {
-            helio_core::shader::create_render_pipeline(
+            helio_core::shader::create_render_pipeline_deferred(
                 &device,
                 wgpu::RenderPipelineDescriptor {
                     label: Some(label),
@@ -1354,7 +1354,7 @@ pub struct FoliageBoxesPass {
     shader: wgpu::ShaderModule,
     layout: wgpu::PipelineLayout,
     occurrence_layout: wgpu::PipelineLayout,
-    finish: wgpu::ComputePipeline,
+    finish: helio_core::shader::DeferredCompute,
     layout_0: wgpu::BindGroupLayout,
     layout_2: wgpu::BindGroupLayout,
     layout_3: wgpu::BindGroupLayout,
@@ -1368,7 +1368,7 @@ pub struct FoliageBoxesPass {
 /// One draw's boxes: its pipeline (`cs_boxes`, or `cs_boxes_occurrence` with the chains in
 /// group 3), its buffers and bind groups.
 struct BoxExpansion {
-    expand: wgpu::ComputePipeline,
+    expand: helio_core::shader::DeferredCompute,
     group_0: Option<((wgpu::Buffer, wgpu::Buffer, wgpu::Buffer), wgpu::BindGroup)>,
     group_2: wgpu::BindGroup,
     group_3: Option<wgpu::BindGroup>,
@@ -1532,8 +1532,8 @@ fn compute_pipeline(
     layout: &wgpu::PipelineLayout,
     module: &wgpu::ShaderModule,
     entry: &str,
-) -> wgpu::ComputePipeline {
-    helio_core::shader::create_compute_pipeline(
+) -> helio_core::shader::DeferredCompute {
+    helio_core::shader::create_compute_pipeline_deferred(
         device,
         wgpu::ComputePipelineDescriptor {
             label: Some(label),

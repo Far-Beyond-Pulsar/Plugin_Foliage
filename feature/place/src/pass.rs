@@ -158,9 +158,9 @@ pub struct FoliagePlacePass {
     occurrence_bgl: wgpu::BindGroupLayout,
     /// Rebuilt when the portals' chain or stage buffer is replaced (they grow).
     occurrence_bind_group: Option<(wgpu::Buffer, wgpu::Buffer, wgpu::BindGroup)>,
-    occurrence_tile_pipeline: wgpu::ComputePipeline,
-    occurrence_cluster_pipeline: wgpu::ComputePipeline,
-    occurrence_finalize_pipeline: wgpu::ComputePipeline,
+    occurrence_tile_pipeline: helio_core::shader::DeferredCompute,
+    occurrence_cluster_pipeline: helio_core::shader::DeferredCompute,
+    occurrence_finalize_pipeline: helio_core::shader::DeferredCompute,
     chain_views_scratch: Vec<crate::GpuChainView>,
     /// Live chains this frame (0: no occurrence cull).
     chain_count: u32,
@@ -168,7 +168,7 @@ pub struct FoliagePlacePass {
     /// its bind group (rebuilt when SceneDB reallocates the column).
     gather_uniforms: wgpu::Buffer,
     gather_rows: u32,
-    gather_pipeline: wgpu::ComputePipeline,
+    gather_pipeline: helio_core::shader::DeferredCompute,
     gather_bind_group: Option<(wgpu::Buffer, wgpu::BindGroup)>,
     placeholder_interactor: wgpu::Buffer,
 
@@ -201,11 +201,11 @@ pub struct FoliagePlacePass {
     place_uniforms: wgpu::Buffer,
     cull_uniforms: wgpu::Buffer,
 
-    place_reset_pipeline: wgpu::ComputePipeline,
-    place_bounds_pipeline: wgpu::ComputePipeline,
-    place_pipeline: wgpu::ComputePipeline,
-    place_finish_pipeline: wgpu::ComputePipeline,
-    query_pipeline: wgpu::ComputePipeline,
+    place_reset_pipeline: helio_core::shader::DeferredCompute,
+    place_bounds_pipeline: helio_core::shader::DeferredCompute,
+    place_pipeline: helio_core::shader::DeferredCompute,
+    place_finish_pipeline: helio_core::shader::DeferredCompute,
+    query_pipeline: helio_core::shader::DeferredCompute,
     /// The frame's parts (`parts` in foliage_place.wgsl), and the placed tiles' height
     /// ranges and record counts while they are placed.
     place_parts: wgpu::Buffer,
@@ -213,10 +213,10 @@ pub struct FoliagePlacePass {
     parts_scratch: Vec<[u32; 4]>,
     place_part_count: u32,
     query_part_count: u32,
-    ground_plane_pipeline: wgpu::ComputePipeline,
-    tile_cull_pipeline: wgpu::ComputePipeline,
-    cluster_cull_pipeline: wgpu::ComputePipeline,
-    finalize_pipeline: wgpu::ComputePipeline,
+    ground_plane_pipeline: helio_core::shader::DeferredCompute,
+    tile_cull_pipeline: helio_core::shader::DeferredCompute,
+    cluster_cull_pipeline: helio_core::shader::DeferredCompute,
+    finalize_pipeline: helio_core::shader::DeferredCompute,
 
     cull_bgl: wgpu::BindGroupLayout,
     /// The frame stats' counters (`FrameStats::buffer`) the finalize adds to.
@@ -689,7 +689,7 @@ impl FoliagePlacePass {
                         layout: &wgpu::PipelineLayout,
                         module: &wgpu::ShaderModule,
                         entry: &str| {
-            helio_core::shader::create_compute_pipeline(
+            helio_core::shader::create_compute_pipeline_deferred(
                 device,
                 wgpu::ComputePipelineDescriptor {
                     label: Some(label),
@@ -751,7 +751,7 @@ impl FoliagePlacePass {
             ])
         };
         let cull_pipeline_with = |label: &str, layout: &wgpu::PipelineLayout, entry: &str| {
-            helio_core::shader::create_compute_pipeline(
+            helio_core::shader::create_compute_pipeline_deferred(
                 device,
                 wgpu::ComputePipelineDescriptor {
                     label: Some(label),
